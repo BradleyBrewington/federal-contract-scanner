@@ -1,0 +1,225 @@
+{
+  "max_score": 100,
+  "categories": {
+    "entry_barrier": {
+      "max_points": 40,
+      "description": "How easy is it for a first-time contractor with no past performance to win this?",
+      "rules": [
+        {
+          "id": "sbir_sttr",
+          "description": "Opportunity is SBIR or STTR (designed for new entrants)",
+          "points": 12
+        },
+        {
+          "id": "eligible_set_aside",
+          "description": "Set-aside I can compete on (Total SB, Partial SB, unrestricted)",
+          "points": 8
+        },
+        {
+          "id": "ineligible_set_aside",
+          "description": "SDVOSB, 8(a), HUBZone, WOSB — HARD DISQUALIFIER, score → 0",
+          "points": -40
+        },
+        {
+          "id": "no_past_performance",
+          "description": "Past performance not required or not heavily weighted",
+          "points": 8
+        },
+        {
+          "id": "new_entrant_friendly",
+          "description": "Explicitly encourages new vendors / emerging small businesses",
+          "points": 5
+        },
+        {
+          "id": "value_micro",
+          "description": "Micro-purchase under $25K",
+          "points": 8
+        },
+        {
+          "id": "value_small",
+          "description": "Small value $25K–$100K",
+          "points": 6
+        },
+        {
+          "id": "value_medium",
+          "description": "Medium value $100K–$250K",
+          "points": 4
+        },
+        {
+          "id": "value_large",
+          "description": "Large value $250K–$500K (need teaming partner)",
+          "points": 1
+        },
+        {
+          "id": "value_too_large",
+          "description": "Over $500K — not realistic for first-time solo",
+          "points": -15
+        },
+        {
+          "id": "no_facility_requirement",
+          "description": "No specialized facility, lab, or manufacturing floor required",
+          "points": 4
+        }
+      ]
+    },
+    "scope_simplicity": {
+      "max_points": 25,
+      "description": "Can one person actually do this work?",
+      "rules": [
+        {
+          "id": "study_report_analysis",
+          "description": "Deliverable is a study, report, analysis, design, or prototype",
+          "points": 8
+        },
+        {
+          "id": "single_person_scope",
+          "description": "Scope appears achievable by 1–2 people",
+          "points": 7
+        },
+        {
+          "id": "clear_deliverables",
+          "description": "Specific, bounded deliverables (not open-ended IDIQ / managed services)",
+          "points": 5
+        },
+        {
+          "id": "short_duration",
+          "description": "Period of performance under 12 months",
+          "points": 3
+        },
+        {
+          "id": "sources_sought_rfi",
+          "description": "RFI / Sources Sought — low effort, builds relationships",
+          "points": 2
+        }
+      ]
+    },
+    "competition_level": {
+      "max_points": 20,
+      "description": "How many competitors will I face, and are they advantaged?",
+      "rules": [
+        {
+          "id": "sbir_sttr_pool",
+          "description": "SBIR/STTR limited innovation-focused competitor pool",
+          "points": 8
+        },
+        {
+          "id": "small_biz_set_aside",
+          "description": "Small business set-aside limits competition",
+          "points": 4
+        },
+        {
+          "id": "not_recompete",
+          "description": "Not a recompete with an established incumbent",
+          "points": 5
+        },
+        {
+          "id": "niche_topic",
+          "description": "Technical topic limits competitors (robotics, mechatronics, etc.)",
+          "points": 3
+        }
+      ]
+    },
+    "skill_match": {
+      "max_points": 25,
+      "description": "How well does this match my actual capabilities?",
+      "rules": [
+        {
+          "id": "direct_skill_match",
+          "description": "Directly matches core skills (mechatronics, 3D printing, PCB, embedded, soft robotics, EOP…)",
+          "points": 15
+        },
+        {
+          "id": "adjacent_skill_match",
+          "description": "Adjacent — could do with modest effort (data analysis, tech writing, prototyping…)",
+          "points": 8
+        },
+        {
+          "id": "generic_services",
+          "description": "Generic services I could do but aren't my strengths",
+          "points": 3
+        },
+        {
+          "id": "parts_procurement_suppression",
+          "description": "Parts/commodity procurement (NSN, FSC code title, repair-of) — keyword match suppressed, 0 pts",
+          "points": 0
+        }
+      ]
+    },
+    "notice_type_modifier": {
+      "description": "Notice type bonus applied in entry_barrier scoring",
+      "rules": [
+        {
+          "id": "live_solicitation",
+          "description": "Solicitation or Combined Synopsis/Solicitation — actively biddable",
+          "points": 8
+        },
+        {
+          "id": "presolicitation",
+          "description": "Presolicitation — pipeline visibility",
+          "points": 4
+        },
+        {
+          "id": "sources_sought",
+          "description": "Sources Sought — respond to shape acquisition",
+          "points": 3
+        },
+        {
+          "id": "special_notice",
+          "description": "Special Notice — review for relevance",
+          "points": 2
+        },
+        {
+          "id": "baa_instrument",
+          "description": "Broad Agency Announcement — ideal solo R&D instrument",
+          "points": 10
+        }
+      ]
+    }
+  },
+  "hard_disqualifiers": {
+    "description": "If ANY trigger, auto-set score=0 and status=SKIP regardless of other scoring",
+    "rules": [
+      {
+        "id": "security_clearance",
+        "detection": "security clearance required / TS/SCI / TOP SECRET / SECRET clearance / facility clearance required / SCIF",
+        "note": "'background investigation' alone is NOT a disqualifier"
+      },
+      {
+        "id": "ineligible_set_aside",
+        "detection": "Set-aside is SDVOSB, VOSB, 8(a), HUBZone, WOSB, or EDWOSB"
+      },
+      {
+        "id": "itar_restricted",
+        "detection": "'ITAR restricted' or 'ITAR compliance required'. 'May be subject to ITAR' is a WARNING, not a disqualifier."
+      },
+      {
+        "id": "excessive_value",
+        "detection": "Estimated value > $2,000,000"
+      },
+      {
+        "id": "classified_work",
+        "detection": "classified information / classified contract / classified program"
+      },
+      {
+        "id": "weapons_ordnance",
+        "detection": "explosives / ordnance / nuclear weapon / chemical weapon / biological weapon / munitions"
+      },
+      {
+        "id": "oem_vendor_lock",
+        "detection": "authorized reseller / OEM partnership required / certified [vendor] integrator"
+      },
+      {
+        "id": "large_team_required",
+        "detection": "5+ FTE / large staff headcount explicitly required"
+      },
+      {
+        "id": "facility_required",
+        "detection": "manufacturing facility / cleanroom / SCIF / accredited laboratory / production facility"
+      },
+      {
+        "id": "award_notice",
+        "detection": "Notice type is Award Notice — contract already awarded, nothing to bid"
+      }
+    ]
+  }
+}

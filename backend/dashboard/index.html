@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Federal Contract Scanner - Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="dashboard">
+        <aside class="sidebar">
+            <h2>Contract Scanner</h2>
+            <div class="nav-item active" data-view="opportunities">Opportunities</div>
+            <div class="nav-item" data-view="teaming">Teaming Leads</div>
+            <div class="nav-item" data-view="archive">Archive</div>
+            <div class="nav-item" data-view="stats">Statistics</div>
+            <div class="nav-item" data-view="settings">Scoring Settings</div>
+            <div style="flex:1"></div>
+            <div class="nav-item" id="logoutBtn">Logout</div>
+        </aside>
+        <main class="main-content" id="mainContent">
+            <div class="spinner">Loading...</div>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

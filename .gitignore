@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+data/opportunities.json
+data/archive.json
+data/teaming_cache.json
+.vscode/
+*.egg-info/
+dist/
+build/
+logs/
+*.xlsx
+.~lock.*
+node_modules/
+.DS_Store

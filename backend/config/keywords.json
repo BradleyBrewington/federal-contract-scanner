@@ -1,0 +1,119 @@
+{
+  "positive_keywords_tier1": {
+    "description": "Direct skill match — my actual capabilities",
+    "weight": 3,
+    "terms": [
+      "mechatronics", "robotics", "soft robotics", "soft robot",
+      "electroosmotic", "electroactive", "EAP",
+      "CAD", "computer-aided design", "3D modeling", "solid modeling",
+      "3D printing", "additive manufacturing", "rapid prototyping",
+      "PCB design", "printed circuit board", "circuit design",
+      "Arduino", "microcontroller", "embedded systems", "embedded software",
+      "control systems", "feedback control", "PID",
+      "actuator", "sensor", "transducer",
+      "compliant mechanism", "flexible mechanism",
+      "haptic", "haptics", "tactile feedback",
+      "prosthetic", "prosthesis", "orthotic",
+      "wearable device", "wearable technology",
+      "microfluidic", "micropump", "hydraulic actuator",
+      "assistive technology", "human-robot interaction",
+      "autonomous systems", "autonomous vehicle", "autonomous robot",
+      "UAS", "UAV", "sUAS", "unmanned aerial", "unmanned system",
+      "human performance", "soldier performance", "warfighter performance",
+      "exoskeleton", "exosuit", "powered exoskeleton",
+      "bio-inspired", "bioinspired", "biomimetic",
+      "electroosmotic", "electroosmosis", "electrokinetic",
+      "fluidic", "lab-on-chip",
+      "ballistic protection", "blast protection",
+      "human-machine interface", "HMI",
+      "wearable sensor", "wearable system",
+      "soft actuator", "pneumatic actuator", "hydraulic soft"
+    ]
+  },
+  "positive_keywords_tier2": {
+    "description": "Adjacent skills — I can do these with modest effort",
+    "weight": 2,
+    "terms": [
+      "prototype", "prototyping", "proof of concept",
+      "feasibility study", "feasibility analysis", "trade study",
+      "design study", "conceptual design", "preliminary design",
+      "modeling and simulation", "computational modeling",
+      "data analysis", "data processing", "data organization",
+      "technical writing", "technical documentation", "technical report",
+      "literature review", "state of the art survey",
+      "requirements analysis", "requirements definition",
+      "systems engineering", "system design",
+      "testing", "test plan", "validation", "verification",
+      "Python", "scripting", "automation",
+      "research", "R&D", "research and development",
+      "SBIR", "STTR", "Phase I", "Phase 1",
+      "small unmanned", "drone",
+      "IoT", "internet of things", "wireless sensor",
+      "broad agency announcement", "BAA",
+      "technology transfer", "tech transfer", "licensing opportunity",
+      "cooperative research", "CRADA",
+      "feasibility demonstration", "TRL", "technology readiness",
+      "counter-UAS", "C-UAS", "anti-drone",
+      "human factors", "ergonomics", "anthropometry",
+      "biomechanics", "biomechanical",
+      "ballast water", "invasive species",
+      "electrochemical", "pulsed field", "pulsed power"
+    ]
+  },
+  "positive_keywords_tier3": {
+    "description": "Generic work I could do — not my strength but not disqualifying",
+    "weight": 1,
+    "terms": [
+      "report writing", "data entry", "data management",
+      "technical support", "training material",
+      "market research", "competitive analysis",
+      "project documentation", "engineering support",
+      "quality assurance", "inspection"
+    ]
+  },
+  "negative_keywords": {
+    "description": "Signals the opportunity is not for me — scoring penalty, not hard disqualification",
+    "terms": [
+      "construction", "janitorial", "food service", "landscaping",
+      "heavy equipment", "vehicle fleet", "vehicle maintenance",
+      "medical staffing", "nursing", "physician",
+      "legal services", "accounting services", "audit services",
+      "15 years experience", "10 years experience",
+      "senior level", "expert level", "principal investigator with PhD",
+      "PhD required", "masters required", "PMP required",
+      "LPTA incumbent", "bridge contract", "incumbent contractor",
+      "production quantity", "mass production", "full rate production",
+      "enterprise deployment", "enterprise-wide",
+      "call center", "customer service center",
+      "security guard", "armed guard", "protective services",
+      "freight", "shipping", "logistics provider",
+      "painting", "plumbing", "HVAC", "electrical contractor"
+    ]
+  },
+  "warning_keywords": {
+    "description": "Not disqualifiers but flag for manual review",
+    "terms": [
+      "may be subject to ITAR", "export controlled",
+      "CUI", "controlled unclassified",
+      "FOUO", "for official use only",
+      "on-site required", "on-site only",
+      "past performance will be evaluated",
+      "CPARS", "relevant experience"
+    ]
+  },
+  "low_barrier_keywords": {
+    "description": "Signals opportunity is friendly to new entrants",
+    "terms": [
+      "new entrant", "new vendor", "emerging small business",
+      "no past performance required", "no prior experience",
+      "simplified acquisition", "SAP",
+      "micro-purchase", "purchase order",
+      "sources sought", "request for information", "RFI",
+      "market research", "industry day",
+      "sole source", "sole-source",
+      "first-time", "will train",
+      "remote", "telework", "work from home",
+      "Phase I", "Phase 1"
+    ]
+  }
+}

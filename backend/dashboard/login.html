@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Federal Contract Scanner - Login</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-card">
+            <h1>Federal Contract Scanner</h1>
+            <p class="subtitle">Opportunity Dashboard</p>
+            <form id="loginForm">
+                <input type="password" id="password" placeholder="Enter password" required>
+                <button type="submit">Login</button>
+                <p id="loginError" class="error" style="display:none">Invalid password</p>
+            </form>
+        </div>
+    </div>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const pw = document.getElementById('password').value;
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({password: pw})
+            });
+            if (res.ok) {
+                window.location.href = '/dashboard';
+            } else {
+                document.getElementById('loginError').style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
