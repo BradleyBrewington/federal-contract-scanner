@@ -855,9 +855,32 @@ def _start_background_summaries(opps: list) -> None:
     threading.Thread(target=_worker, daemon=True).start()
 
 
+def _clean_description_text(text: str) -> str:
+    """Normalize plain-text description: reflow paragraphs, strip noise.
+    - Converts single newlines within a paragraph to spaces (reflowing text)
+    - Preserves paragraph breaks (blank lines)
+    - Strips leading/trailing whitespace from each line
+    - Collapses excessive blank lines
+    """
+    if not text:
+        return ""
+    # Normalize line endings
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    # Split into blocks on blank lines
+    blocks = re.split(r'\n{2,}', text)
+    cleaned_blocks = []
+    for block in blocks:
+        # Within each block, collapse newlines and extra spaces to a single space
+        lines = [line.strip() for line in block.split('\n')]
+        joined = ' '.join(l for l in lines if l)
+        if joined:
+            cleaned_blocks.append(joined)
+    return '\n\n'.join(cleaned_blocks).strip()
+
+
 def _fetch_description_text(notice_id: str, max_chars: int = 1500) -> str:
-    """Fetch real description HTML from SAM.gov and strip it to plain text.
-    Returns empty string on any failure."""
+    """Fetch real description HTML from SAM.gov and convert to clean plain text.
+    Preserves paragraph structure. Returns empty string on any failure."""
     if not SAM_API_KEY or not notice_id:
         return ""
     try:
@@ -869,10 +892,16 @@ def _fetch_description_text(notice_id: str, max_chars: int = 1500) -> str:
         if resp.status_code != 200:
             logger.warning(f"SAM noticedesc returned {resp.status_code} for notice_id={notice_id}")
             return ""
-        # Strip HTML tags, collapse whitespace
-        text = re.sub(r'<[^>]+>', ' ', resp.text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text[:max_chars]
+        html = resp.text
+        # Convert block-level elements to newlines before stripping tags
+        html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+        html = re.sub(r'</(p|div|li|tr|h[1-6])>', '\n', html, flags=re.IGNORECASE)
+        # Strip remaining tags
+        text = re.sub(r'<[^>]+>', '', html)
+        # Decode common HTML entities
+        text = (text.replace('&nbsp;', ' ').replace('&amp;', '&')
+                .replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"').replace('&#39;', "'"))
+        return _clean_description_text(text)[:max_chars]
     except Exception as e:
         logger.warning(f"Description fetch failed for {notice_id}: {e}")
         return ""
@@ -1390,9 +1419,9 @@ def format_card(opp: dict, score: int = None) -> dict:
         "ai_summary": opp.get("ai_summary"),
         "parsed_scope": parsed_scope,
         # Raw description text when it's actual text (not a SAM.gov URL).
-        # URLs are resolved to real text in get_feed() before format_card() is called,
-        # so by the time we get here the description field should be actual content.
-        "description_text": raw_desc[:8000] if raw_desc and not raw_desc.strip().startswith("http") else None,
+        # URLs are resolved to real text in get_feed() before format_card() is called.
+        # Apply _clean_description_text() to normalize paragraph structure.
+        "description_text": _clean_description_text(raw_desc)[:8000] if raw_desc and not raw_desc.strip().startswith("http") else None,
         "attachments": opp.get("attachments") or "[]",
         "has_attachments": bool(opp.get("attachments") and opp["attachments"] != "[]"),
         "score": score,

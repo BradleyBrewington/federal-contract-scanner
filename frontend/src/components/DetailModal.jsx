@@ -75,7 +75,9 @@ export default function DetailModal({ card, onClose, onPass, onSave }) {
           {/* Raw description text — when available as text (not a URL) */}
           {card.description_text && (
             <Section label="Description">
-              <p style={styles.descText}>{card.description_text}</p>
+              {card.description_text.split('\n\n').map((para, i) => (
+                <p key={i} style={styles.descText}>{para}</p>
+              ))}
             </Section>
           )}
 
@@ -253,10 +255,9 @@ const styles = {
   },
   scopeValue: { fontSize: '13px', color: 'var(--text)', fontWeight: '500' },
 
-  // Description text
+  // Description text — one <p> per paragraph, no pre-wrap needed
   descText: {
-    fontSize: '13px', color: 'var(--text)', lineHeight: '1.7',
-    whiteSpace: 'pre-wrap',
+    fontSize: '13px', color: 'var(--text)', lineHeight: '1.7', marginBottom: '8px',
   },
 
   // No description fallback
