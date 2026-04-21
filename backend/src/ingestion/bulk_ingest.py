@@ -286,7 +286,9 @@ def write_last_run():
 
 def run_full_load():
     """
-    Download all active opportunities posted in the last 365 days.
+    Download all opportunities posted in the last 12 months.
+    Uses two 6-month windows — SAM.gov rejects ranges exceeding ~180 days
+    when they cross a calendar year boundary.
     Run once on initial setup.
     """
     logger.info("=== FULL LOAD starting ===")
@@ -294,17 +296,38 @@ def run_full_load():
     api_key = get_sam_api_key()
 
     today = datetime.now()
-    posted_to = today.strftime("%m/%d/%Y")
-    posted_from = (today - timedelta(days=365)).strftime("%m/%d/%Y")
+    all_raw = []
 
-    raw_records = fetch_all_opportunities(api_key, posted_from, posted_to)
-    if not raw_records:
+    # Window 1: last 6 months
+    w1_to = today
+    w1_from = today - timedelta(days=180)
+    logger.info("Fetching window 1: last 6 months")
+    batch1 = fetch_all_opportunities(
+        api_key,
+        w1_from.strftime("%m/%d/%Y"),
+        w1_to.strftime("%m/%d/%Y"),
+    )
+    all_raw.extend(batch1)
+    logger.info(f"Window 1: {len(batch1):,} records")
+
+    # Window 2: 6–12 months ago
+    w2_to = today - timedelta(days=181)
+    w2_from = today - timedelta(days=365)
+    logger.info("Fetching window 2: 6–12 months ago")
+    batch2 = fetch_all_opportunities(
+        api_key,
+        w2_from.strftime("%m/%d/%Y"),
+        w2_to.strftime("%m/%d/%Y"),
+    )
+    all_raw.extend(batch2)
+    logger.info(f"Window 2: {len(batch2):,} records")
+
+    if not all_raw:
         logger.error("No records fetched. Check your SAM_API_KEY and network.")
         return
 
-    logger.info(f"Parsing {len(raw_records):,} records...")
-    # Filter out records with no notice_id (malformed)
-    parsed = [parse_opportunity(r) for r in raw_records if r.get("noticeId")]
+    logger.info(f"Total fetched: {len(all_raw):,} records across both windows")
+    parsed = [parse_opportunity(r) for r in all_raw if r.get("noticeId")]
 
     logger.info(f"Upserting {len(parsed):,} records to Supabase...")
     written = upsert_all(supabase, parsed)
@@ -333,7 +356,7 @@ def run_delta_load():
 
     today = datetime.now()
     posted_to = today.strftime("%m/%d/%Y")
-    posted_from = (today - timedelta(days=365)).strftime("%m/%d/%Y")
+    posted_from = (today - timedelta(days=180)).strftime("%m/%d/%Y")  # 6-month window max
 
     logger.info(f"Fetching records modified since {modified_from}")
     raw_records = fetch_all_opportunities(
