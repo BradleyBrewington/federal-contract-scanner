@@ -77,7 +77,7 @@ def fetch_page(api_key: str, params: dict, attempt: int = 1) -> dict | None:
         return resp.json()
 
     except requests.RequestException as e:
-        if attempt < 3:
+        if attempt < 5:
             wait = 2 ** attempt
             logger.warning(f"Request failed ({e}). Retrying in {wait}s...")
             time.sleep(wait)
@@ -98,7 +98,6 @@ def fetch_all_opportunities(api_key: str, posted_from: str, posted_to: str, modi
         "postedTo": posted_to,
         "limit": BATCH_SIZE,
         "offset": 0,
-        "active": "true",
     }
 
     if modified_from:
