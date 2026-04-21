@@ -30,9 +30,10 @@ export const api = {
   // Feed
   getFeed: (limit = 20) => get(`/api/v2/feed?limit=${limit}`),
 
-  // Opportunity detail + AI summary
+  // Opportunity detail + AI
   getOpportunity: (id) => get(`/api/v2/opportunities/${id}`),
   generateSummary: (id) => post(`/api/v2/opportunities/${id}/summary`),
+  getAnalysis: (id) => post(`/api/v2/opportunities/${id}/analysis`),
 
   // Company profile
   getProfile: () => get('/api/v2/company/profile'),
@@ -68,6 +69,27 @@ export const db = {
   // Update pipeline stage
   updatePipelineStage: async (pipelineId, stage) => {
     return supabase.from('pipeline').update({ stage }).eq('id', pipelineId)
+  },
+
+  // Count actual left/right swipes today (excludes detail-view expands)
+  getTodaySwipeCount: async (userId) => {
+    const todayStart = new Date()
+    todayStart.setHours(0, 0, 0, 0)
+    const { count } = await supabase
+      .from('swipes')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .in('direction', ['left', 'right'])
+      .gte('created_at', todayStart.toISOString())
+    return count || 0
+  },
+
+  // Record that a user opened the detail view.
+  // Note: swipes table direction column only allows 'left'/'right' — detail views
+  // are tracked via the `expanded` flag on the actual swipe record when it's created.
+  recordDetailView: async ({ userId, companyId, opportunityId }) => {
+    // No-op until a separate detail_views table is added to the schema
+    return Promise.resolve()
   },
 
   // Get pipeline for company

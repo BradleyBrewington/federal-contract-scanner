@@ -4,12 +4,39 @@ import OpportunityCard from '../components/OpportunityCard'
 import DetailModal from '../components/DetailModal'
 import { api, db } from '../lib/api'
 
+const SESSION_SWIPE_KEY = 'govscroll_swipe_count'
+const SESSION_CARDS_TS_KEY = 'govscroll_cards_ts'
+const QUEUE_MAX_AGE_MS = 4 * 60 * 60 * 1000  // 4 hours — stale after this
+
+// Bump this when card payload schema changes to auto-invalidate old caches
+const CARD_SCHEMA_VERSION = 4
+const SESSION_CARDS_KEY = `govscroll_cards_v${CARD_SCHEMA_VERSION}`
+
+function readSavedCards() {
+  try {
+    const ts = parseInt(sessionStorage.getItem(SESSION_CARDS_TS_KEY) || '0', 10)
+    if (Date.now() - ts < QUEUE_MAX_AGE_MS) {
+      const raw = sessionStorage.getItem(SESSION_CARDS_KEY)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed
+      }
+    }
+  } catch {}
+  return null
+}
+
 export default function Feed({ user, company }) {
-  const [cards, setCards] = useState([])
-  const [loading, setLoading] = useState(true)
+  // Restore card queue from sessionStorage on mount (survives tab discard)
+  const savedCards = useRef(readSavedCards())
+  const [cards, setCards] = useState(savedCards.current || [])
+  const [loading, setLoading] = useState(!savedCards.current)
   const [exhausted, setExhausted] = useState(false)
-  const [lastSwipe, setLastSwipe] = useState(null)  // { direction, title }
-  const [swipeCount, setSwipeCount] = useState(0)
+  const [loadError, setLoadError] = useState(false)
+  const [lastSwipe, setLastSwipe] = useState(null)
+  const [swipeCount, setSwipeCount] = useState(
+    () => parseInt(sessionStorage.getItem(SESSION_SWIPE_KEY) || '0', 10)
+  )
   const [expandedCard, setExpandedCard] = useState(null)
   const cardRefs = useRef([])
   const swipeStartTime = useRef(null)
@@ -17,15 +44,39 @@ export default function Feed({ user, company }) {
   // Top card is always the last element in the array
   const currentIndex = cards.length - 1
 
+  // Persist swipe count to sessionStorage whenever it changes
+  useEffect(() => {
+    sessionStorage.setItem(SESSION_SWIPE_KEY, String(swipeCount))
+  }, [swipeCount])
+
+  // Load accurate swipe count from Supabase on mount
+  useEffect(() => {
+    if (!user?.id) return
+    db.getTodaySwipeCount(user.id)
+      .then(count => setSwipeCount(count))
+      .catch(() => {})
+  }, [user?.id])
+
+  // Persist card queue to sessionStorage after every change so tab restores work
+  useEffect(() => {
+    if (cards.length > 0) {
+      try {
+        sessionStorage.setItem(SESSION_CARDS_KEY, JSON.stringify(cards))
+        sessionStorage.setItem(SESSION_CARDS_TS_KEY, String(Date.now()))
+      } catch {}
+    }
+  }, [cards])
+
   const loadFeed = useCallback(async () => {
     setLoading(true)
+    setLoadError(false)
     try {
-      const data = await api.getFeed(20)
+      const data = await api.getFeed(30)
       if (data.exhausted || !data.cards?.length) {
         setExhausted(true)
       } else {
+        setExhausted(false)
         setCards(prev => {
-          // Append new cards, avoiding duplicates
           const existingIds = new Set(prev.map(c => c.id))
           const fresh = data.cards.filter(c => !existingIds.has(c.id))
           return [...fresh, ...prev]
@@ -33,16 +84,21 @@ export default function Feed({ user, company }) {
       }
     } catch (err) {
       console.error('Feed load failed:', err)
+      setLoadError(true)
     } finally {
       setLoading(false)
     }
   }, [])
 
+  // On mount: skip load if we restored a healthy queue, otherwise load from API.
+  // Also load if the restored queue is running low.
   useEffect(() => {
-    loadFeed()
+    if (!savedCards.current || savedCards.current.length <= 6) {
+      loadFeed()
+    }
   }, [loadFeed])
 
-  // Track dwell time — starts when a card becomes the top card
+  // Track dwell time — starts when a new card becomes the top card
   useEffect(() => {
     swipeStartTime.current = Date.now()
   }, [currentIndex])
@@ -53,15 +109,14 @@ export default function Feed({ user, company }) {
     setLastSwipe({ direction, title: card.title })
     setSwipeCount(prev => prev + 1)
 
-    // Remove card from deck — this advances to the next card
+    // Remove card from deck
     setCards(prev => prev.filter(c => c.id !== card.id))
 
-    // Load more when running low (cards.length - 1 = deck size after this swipe)
-    if (cards.length - 1 <= 3 && !exhausted) {
+    // Refill when running low
+    if (cards.length - 1 <= 6 && !exhausted) {
       loadFeed()
     }
 
-    // Record swipe in Supabase
     db.recordSwipe({
       userId: user.id,
       companyId: company.id,
@@ -71,7 +126,6 @@ export default function Feed({ user, company }) {
       expanded: false,
     }).catch(err => console.error('Swipe record failed:', err))
 
-    // If swiped right, also add to pipeline
     if (direction === 'right') {
       db.addToPipeline({
         companyId: company.id,
@@ -81,17 +135,39 @@ export default function Feed({ user, company }) {
     }
   }, [user, company, cards.length, exhausted, loadFeed])
 
-  // Programmatic swipe via buttons
   const swipe = async (direction) => {
     const ref = cardRefs.current[currentIndex]
     if (ref) await ref.swipe(direction)
   }
+
+  // Record detail view as an interest signal, then open the modal
+  const handleExpand = useCallback((card) => {
+    setExpandedCard(card)
+    db.recordDetailView({
+      userId: user.id,
+      companyId: company.id,
+      opportunityId: card.id,
+    }).catch(() => {})
+  }, [user.id, company.id])
 
   if (loading && cards.length === 0) {
     return (
       <div style={styles.centered}>
         <div style={styles.spinner} />
         <p style={{ color: 'var(--muted)', marginTop: '16px', fontSize: '14px' }}>Loading your feed...</p>
+      </div>
+    )
+  }
+
+  if (loadError && cards.length === 0) {
+    return (
+      <div style={styles.centered}>
+        <p style={{ fontSize: '32px' }}>⚠️</p>
+        <h3 style={{ color: 'var(--text)', margin: '12px 0 8px' }}>Could not reach the server</h3>
+        <p style={{ color: 'var(--muted)', fontSize: '13px', textAlign: 'center', maxWidth: '280px', lineHeight: '1.6' }}>
+          Make sure the Flask API is running on port 5001, then retry.
+        </p>
+        <button style={styles.refreshBtn} onClick={loadFeed}>Retry</button>
       </div>
     )
   }
@@ -141,7 +217,8 @@ export default function Feed({ user, company }) {
             <OpportunityCard
               card={card}
               isTop={index === currentIndex}
-              onExpand={() => setExpandedCard(card)}
+              preload={index >= currentIndex - 2}
+              onExpand={() => handleExpand(card)}
               style={{
                 transform: index === currentIndex
                   ? 'scale(1)'
@@ -161,7 +238,7 @@ export default function Feed({ user, company }) {
       <div style={styles.actions}>
         <ActionBtn onClick={() => swipe('left')} color="#ef4444" label="Pass">✕</ActionBtn>
         <ActionBtn
-          onClick={() => setExpandedCard(cards[currentIndex])}
+          onClick={() => cards[currentIndex] && handleExpand(cards[currentIndex])}
           color="#6366f1"
           label="Details"
         >
@@ -243,7 +320,6 @@ const styles = {
     padding: '6px 14px',
     borderRadius: '20px',
     border: '1px solid',
-    animation: 'none',
   },
   deck: {
     position: 'relative',

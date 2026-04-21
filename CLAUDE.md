@@ -20,17 +20,29 @@ A multi-tenant, feed-driven federal contracting opportunity intelligence platfor
 
 ### What is built and working
 - **Monorepo structure:** `backend/` (Flask) + `frontend/` (React + Vite)
-- **Database:** Supabase PostgreSQL with full schema (companies, users, opportunities, swipes, pipeline, company_naics, company_keywords, company_agencies). **35,914 opportunities ingested.**
+- **Database:** Supabase PostgreSQL with full schema (companies, users, opportunities, swipes, pipeline, company_naics, company_keywords, company_agencies). **35,914 opportunities ingested.** `ai_analysis` column added (TEXT, nullable).
 - **Auth:** Supabase Auth (email/password, email confirmation disabled for dev)
 - **RLS:** Policies in place. `my_company_id()` is SECURITY DEFINER. Users SELECT policy uses `id = auth.uid()` (not circular).
 - **Signup flow:** `POST /api/v2/auth/register` on Flask backend creates company + user rows using service key (bypasses RLS).
 - **Onboarding:** 4-step profile setup (contract size, NAICS, keywords, exclusions). Working end-to-end.
 - **Flask API v2** (`backend/src/api/v2.py`): Feed, AI summary, opportunity detail, company profile, health check, register endpoints.
 - **Feed UI:** Tinder-style swipe deck. Cards fly off correctly on swipe (fixed). Pass/Save buttons. Right swipes auto-added to pipeline. Refills when running low.
-- **Card detail view:** Slide-up bottom sheet (`DetailModal.jsx`) with full opportunity details, AI summary, metadata grid, attachments, SAM.gov link, Pass/Save actions.
-- **AI summaries:** Pre-generated on the backend for the first 6 cards per feed load (4 parallel Haiku calls, ~1s). Cached in DB. On-demand fallback for subsequent cards. Loading spinner shown while generating.
+- **Card detail view:** Slide-up bottom sheet (`DetailModal.jsx`) — zero AI calls, instant load. Shows structured scope (DLA parsed fields), raw description text, metadata grid, attachments, SAM.gov link, Pass/Save actions.
+- **AI summaries:** Pre-generated on backend in background thread for top 12 cards per feed load (~4 parallel Haiku calls). Cached in `ai_summary` DB column. Used in Scope row on card when no structured DLA scope available.
 - **Title cleaning:** SAM.gov PSC prefixes stripped (e.g. `J--`, `47--`). All-caps converted to title case with acronym preservation (HVAC, DOD, NSA, USAF, etc.).
-- **Feed query:** Shows all active opportunities (no deadline filter — null deadlines allowed). Scoring returns 0 for expired records. 500-candidate pool, 70/20/10 mix.
+- **Feed query:** Filters to actionable notice types only (`solicitation`, `presolicitation`, `combined`, `sources_sought`, `special`). Award notices, J&As, modifications excluded. No deadline filter — null deadlines allowed. Scoring returns 0 for expired records. 500-candidate pool, 70/20/10 mix, batch size 30, refill threshold 6 cards remaining.
+- **Description fetch:** When description field is a SAM.gov URL, `_fetch_description_text()` follows it to get real HTML, strips tags, feeds 1500 chars into AI prompt.
+- **Card UI (OpportunityCard):** Labeled row layout — Fit / Scope / Buyer / Effort rows. Disqualifier flag pills (clearance=red, cert=orange, vehicle=cyan, sole=yellow). Urgency-colored deadline dot. Score bar.
+- **NAICS/PSC lookup tables:** ~300 NAICS codes (6-digit) + PSC letter-prefix categories. Returns `industry_label` and human-readable titles on card and in detail modal.
+- **Disqualifier flags:** `_extract_flags()` regex on description for security clearance, CMMC, ITAR, DIBBS, GSA Schedule, sole source. Shown as colored pills on quickview card.
+- **Deadline extraction:** `_extract_deadline_from_description()` regex finds embedded deadline dates in description text (e.g. "proposals due May 8, 2026"). Used as fallback when DB `response_deadline` is null. Cards show `*` asterisk when derived.
+- **Complexity estimation:** `_estimate_complexity()` returns High/Medium/Low from NAICS prefix rules. Shown in Effort row.
+- **DLA scope parsing:** `_parse_scope()` extracts NSN, quantity+unit, delivery days ADO, approved source, and item name from DLA description text.
+- **format_card() fields:** `industry_label`, `location`, `flags`, `complexity`, `days_left`, `days_left_derived`, `description_text` (raw, truncated 3000 chars, null if URL), `attachments` (full JSON string).
+- **sessionStorage versioning:** `CARD_SCHEMA_VERSION = 4`, key = `govscroll_cards_v4`. Bumping version auto-discards stale caches lacking new fields.
+- **CORS fix:** `require_auth` decorator returns `200` for OPTIONS preflight before checking JWT. Prevents 401s on cross-origin requests.
+- **Swipe recording fix:** `recordDetailView` is a no-op Promise — doesn't write `direction: 'expand'` to swipes table (violates DB CHECK constraint).
+- **Swipe count:** Loaded from Supabase on Feed mount. Persisted to sessionStorage (survives tab switches/restores).
 - **Bulk ingestion:** `backend/src/ingestion/bulk_ingest.py` — two 6-month windows, 250-row upsert batches, `--full` and `--delta` modes.
 - **Expiration job:** `backend/src/ingestion/expiration.py` — marks past-deadline records as expired nightly.
 - **Git + GitHub:** Repo at github.com/BradleyBrewington/Doom-Scroll-Gov-Contracts. Windows Credential Manager stores PAT.
@@ -46,9 +58,11 @@ A multi-tenant, feed-driven federal contracting opportunity intelligence platfor
 
 ### Known issues / next things to verify
 1. **Onboarding data persistence** — the 4-step flow needs end-to-end verification that all data lands in Supabase (`companies`, `company_naics`, `company_keywords`). Likely works but hasn't been confirmed with data inspection.
-2. **AI summary Anthropic key** — summaries generate fine when the key is valid. If cards show spinners indefinitely, the `.env` key may be wrong or expired.
+2. **AI summary Anthropic key** — summaries generate fine when the key is valid. If Scope row shows empty for non-DLA cards, the `.env` key may be wrong or expired.
 3. **Feed score tuning** — with no NAICS/keywords set during onboarding, all opportunities score similarly. The feed works but feels random. Score improves once onboarding is complete.
-4. **DetailModal `sam_url`** — uses `notice_id` from the card payload. If `notice_id` is null for some records, the SAM.gov link will be broken.
+4. **DetailModal `sam_url`** — uses `card.sam_url` first, falls back to `https://sam.gov/opp/{notice_id}/view`. If `notice_id` is null for some records, the SAM.gov link will be broken.
+5. **DLA Scope row often empty** — DLA records have URL descriptions; `_parse_scope()` runs on the raw URL string, returns nothing. `ai_summary` is also null for low-scoring DLA records (never pre-generated). Scope row silently disappears. Acceptable trade-off — avoids false data.
+6. **ai_analysis column unused** — Column exists in Supabase but the analysis endpoint is no longer called from the frontend. Could be dropped or repurposed later.
 
 ---
 
@@ -172,9 +186,18 @@ Critical — the RLS setup had a circular dependency bug that took significant t
 - [x] Right-swipe → pipeline insert
 - [x] Swipe mechanic works (cards fly off, deck advances correctly)
 - [x] AI summaries pre-generated per feed load (parallel Haiku, cached in DB)
-- [x] Card detail bottom sheet (DetailModal)
+- [x] Card detail bottom sheet (DetailModal) — instant load, zero AI, raw SAM data
 - [x] Title cleaning (PSC prefix removal, smart title case)
 - [x] Feed query fixed — all active records shown, not just those with future deadlines
+- [x] NAICS/PSC lookup tables expanded (~300 codes + PSC prefix categories)
+- [x] Disqualifier flags (clearance, CMMC, ITAR, DIBBS, GSA Schedule, sole source)
+- [x] Labeled row card layout (Fit / Scope / Buyer / Effort / Deadline)
+- [x] Deadline extraction from description text (regex fallback, `days_left_derived` flag)
+- [x] Complexity estimation from NAICS prefix
+- [x] DLA scope parsing (NSN, qty, delivery, approved source, item name)
+- [x] sessionStorage schema versioning (v4 — auto-invalidates stale caches)
+- [x] CORS OPTIONS preflight fix in require_auth decorator
+- [x] Swipe direction constraint fix (recordDetailView is no-op)
 - [ ] **Verify onboarding saves all 4 steps to Supabase correctly**
 - [ ] Keyboard navigation (arrow keys / J/K to swipe)
 - [ ] "Saved" opportunities list page (pipeline view)
@@ -231,16 +254,24 @@ Critical — the RLS setup had a circular dependency bug that took significant t
 | 2026-04-20 | Remove deadline filter from feed query | SAM.gov records often have null deadlines (awards, pre-sols); filtering by deadline > now cut pool from 35k to ~24 records |
 | 2026-04-20 | Pre-generate summaries in feed endpoint | Lazy frontend generation caused "no description" on all cards; parallel Haiku calls add ~1s to feed load but arrive ready |
 | 2026-04-20 | Remove card from cards array on swipe | react-tinder-card bounces card back if state isn't updated; must filter swiped card out immediately in onSwipe |
+| 2026-04-21 | DetailModal: zero AI, raw SAM data only | AI analysis was always null (cached before generation, or never generated for DLA records). Raw description_text + parsed_scope loads instantly. |
+| 2026-04-21 | Labeled row layout on quickview card | Prose AI description truncated badly and wasn't scannable. Labeled rows (Fit/Scope/Buyer/Effort) are faster to read and filter. |
+| 2026-04-21 | Deadline regex fallback from description text | ~40% of records have null response_deadline in DB; many have human-readable dates in description. Regex extracts these for urgency scoring. |
+| 2026-04-21 | sessionStorage schema versioning | New card fields (flags, industry_label, etc.) weren't reaching the frontend — old cached payloads were served instead. Version key forces fresh fetch. |
+| 2026-04-21 | CORS fix: OPTIONS returns 200 before JWT check | /analysis endpoint was returning 401 on preflight. CORS headers weren't applied yet when require_auth rejected the request. |
+| 2026-04-21 | recordDetailView is a no-op | Writing direction='expand' to swipes table violated CHECK constraint (only 'left'/'right' allowed). Detail views tracked via expanded flag on actual swipe. |
 
 ---
 
 ## 10. What To Do Next Session
 
+**Before starting:** Restart Flask (`py -3 backend/src/api/v2.py`) to pick up all session 4 changes. Frontend will auto-discard stale sessionStorage cache (CARD_SCHEMA_VERSION=4) on next load.
+
 **Immediate (finish Phase 1):**
 
 1. **Verify onboarding end-to-end** — complete all 4 steps as a new user and confirm data in Supabase: `companies` (contract_min, contract_max, clearance, set_asides), `company_naics`, `company_keywords`. This is the last unverified piece of Phase 1.
 
-2. **"Saved" opportunities page** — users who right-swipe have no way to see what they saved. Build a simple list view that queries the `pipeline` table joined to `opportunities`. Add a nav tab to switch between Feed and Saved.
+2. **"Saved" opportunities page** — users who right-swipe have no way to see what they saved. Build a simple list view that queries the `pipeline` table joined to `opportunities`. Add a bottom nav tab to switch between Feed and Saved. The `db.getPipeline(companyId)` helper in `api.js` already exists.
 
 3. **Keyboard navigation** — arrow left/right (or J/K) to trigger swipe. Small UX win, important for desktop users.
 
@@ -250,4 +281,4 @@ Critical — the RLS setup had a circular dependency bug that took significant t
 
 ---
 
-*Last updated: 2026-04-20 | Session 3: Swipe mechanic fixed, AI summaries pre-generated, card detail modal built, title cleaning, feed query fixed (35k+ opportunities now accessible).*
+*Last updated: 2026-04-21 | Session 4: Card UI redesigned (labeled rows, disqualifier flags), DetailModal rewritten (zero AI, instant load), NAICS/PSC lookup tables expanded, deadline regex extraction, complexity estimation, DLA scope parsing, sessionStorage versioning, CORS fix, swipe direction fix.*
