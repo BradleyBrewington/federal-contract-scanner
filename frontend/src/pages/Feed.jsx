@@ -9,7 +9,7 @@ const SESSION_CARDS_TS_KEY = 'govscroll_cards_ts'
 const QUEUE_MAX_AGE_MS = 4 * 60 * 60 * 1000  // 4 hours — stale after this
 
 // Bump this when card payload schema changes to auto-invalidate old caches
-const CARD_SCHEMA_VERSION = 4
+const CARD_SCHEMA_VERSION = 5
 const SESSION_CARDS_KEY = `govscroll_cards_v${CARD_SCHEMA_VERSION}`
 
 function readSavedCards() {

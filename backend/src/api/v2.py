@@ -802,6 +802,33 @@ def get_feed():
     # Build score lookup for final set
     score_map = {id(o): s for s, o in scored}
 
+    # Resolve URL descriptions synchronously before building cards.
+    # All SAM.gov records store a noticedesc API URL in the description field.
+    # We fetch the real text in parallel (up to 6 concurrent, 12s timeout) so the
+    # detail view has content on this response. Fetched text is written back to the
+    # DB in a background thread so subsequent loads are instant.
+    url_desc_opps = [o for o in final if (o.get("description") or "").strip().startswith("http")]
+    if url_desc_opps:
+        fetched_descs = _fetch_descriptions_parallel(url_desc_opps)
+        if fetched_descs:
+            opp_by_id = {o["id"]: o for o in final}
+            for opp_id, text in fetched_descs.items():
+                if opp_id in opp_by_id:
+                    opp_by_id[opp_id]["description"] = text
+            # Persist to DB in background — next load skips the fetch entirely
+            def _persist_descriptions(desc_map):
+                sb2 = get_sb()
+                for oid, txt in desc_map.items():
+                    try:
+                        sb2.table("opportunities").update({"description": txt}).eq("id", oid).execute()
+                    except Exception as e:
+                        logger.warning(f"Description persist failed for {oid}: {e}")
+            threading.Thread(
+                target=_persist_descriptions,
+                args=(dict(fetched_descs),),
+                daemon=True,
+            ).start()
+
     # Kick off summary generation in a background thread — don't block the response.
     # Cards that already have ai_summary cached in the DB come back populated.
     # New ones will be ready on the next feed load or on-demand fetch.
@@ -828,7 +855,7 @@ def _start_background_summaries(opps: list) -> None:
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def _fetch_description_text(notice_id: str) -> str:
+def _fetch_description_text(notice_id: str, max_chars: int = 1500) -> str:
     """Fetch real description HTML from SAM.gov and strip it to plain text.
     Returns empty string on any failure."""
     if not SAM_API_KEY or not notice_id:
@@ -845,10 +872,38 @@ def _fetch_description_text(notice_id: str) -> str:
         # Strip HTML tags, collapse whitespace
         text = re.sub(r'<[^>]+>', ' ', resp.text)
         text = re.sub(r'\s+', ' ', text).strip()
-        return text[:1500]
+        return text[:max_chars]
     except Exception as e:
         logger.warning(f"Description fetch failed for {notice_id}: {e}")
         return ""
+
+
+def _fetch_descriptions_parallel(opps: list) -> dict:
+    """Fetch real description text from SAM.gov for all opps whose description field is a URL.
+    Returns {opp_id: text}. Never raises. Uses up to 6 parallel workers with 12s timeout."""
+    url_opps = [o for o in opps if (o.get("description") or "").strip().startswith("http")]
+    if not url_opps:
+        return {}
+
+    results = {}
+
+    def _fetch_one(opp):
+        text = _fetch_description_text(opp.get("notice_id", ""), max_chars=8000)
+        return opp["id"], text
+
+    with ThreadPoolExecutor(max_workers=min(len(url_opps), 6)) as ex:
+        futures = {ex.submit(_fetch_one, o): o["id"] for o in url_opps}
+        try:
+            for future in as_completed(futures, timeout=12):
+                try:
+                    opp_id, text = future.result()
+                    if text:
+                        results[opp_id] = text
+                except Exception as e:
+                    logger.warning(f"Desc fetch future error: {e}")
+        except Exception:
+            logger.warning("Description parallel fetch timed out — returning partial results")
+    return results
 
 
 def _generate_one_summary(opp: dict) -> tuple[str, str | None]:
@@ -1335,8 +1390,9 @@ def format_card(opp: dict, score: int = None) -> dict:
         "ai_summary": opp.get("ai_summary"),
         "parsed_scope": parsed_scope,
         # Raw description text when it's actual text (not a SAM.gov URL).
-        # Passed to detail view so it can display solicitation text with no extra API call.
-        "description_text": raw_desc[:3000] if raw_desc and not raw_desc.strip().startswith("http") else None,
+        # URLs are resolved to real text in get_feed() before format_card() is called,
+        # so by the time we get here the description field should be actual content.
+        "description_text": raw_desc[:8000] if raw_desc and not raw_desc.strip().startswith("http") else None,
         "attachments": opp.get("attachments") or "[]",
         "has_attachments": bool(opp.get("attachments") and opp["attachments"] != "[]"),
         "score": score,
