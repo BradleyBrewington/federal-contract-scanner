@@ -2,6 +2,10 @@ import { useState } from 'react'
 import { supabase } from '../lib/supabase'
 import { db } from '../lib/api'
 
+async function signOut() {
+  await supabase.auth.signOut()
+}
+
 const STEPS = ['Company basics', 'What you pursue', 'Capabilities', 'Exclusions']
 
 const SET_ASIDES = [
@@ -15,6 +19,7 @@ const SET_ASIDES = [
 export default function Onboarding({ user, company, onComplete }) {
   const [step, setStep] = useState((company?.onboarding_step || 1) - 1)
   const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
 
   // Step 1 state
   const [contractMin, setContractMin] = useState(company?.contract_min || '')
@@ -64,9 +69,11 @@ export default function Onboarding({ user, company, onComplete }) {
 
   async function saveStep(nextStep) {
     setSaving(true)
+    setError('')
     try {
+      if (!company?.id) throw new Error('Company not found. Try signing out and back in.')
       if (step === 0) {
-        await db.saveCompany(company.id, {
+        const { error: e } = await db.saveCompany(company.id, {
           contract_min: contractMin ? Number(contractMin) : null,
           contract_max: contractMax ? Number(contractMax) : null,
           prime_sub_preference: primeSubPref,
@@ -74,26 +81,34 @@ export default function Onboarding({ user, company, onComplete }) {
           set_aside_eligibility: selectedSetAsides,
           onboarding_step: 2,
         })
+        if (e) throw new Error(e.message)
       } else if (step === 1) {
-        await db.saveNaics(company.id, naicsList)
-        await db.saveCompany(company.id, { onboarding_step: 3 })
+        const { error: e1 } = await db.saveNaics(company.id, naicsList)
+        if (e1) throw new Error(e1.message)
+        const { error: e2 } = await db.saveCompany(company.id, { onboarding_step: 3 })
+        if (e2) throw new Error(e2.message)
       } else if (step === 2) {
-        await db.saveCompany(company.id, { capabilities_statement: capStatement, onboarding_step: 4 })
+        const { error: e1 } = await db.saveCompany(company.id, { capabilities_statement: capStatement, onboarding_step: 4 })
+        if (e1) throw new Error(e1.message)
         const allKeywords = keywords.map(k => ({ keyword: k, is_exclusion: false }))
-        await db.saveKeywords(company.id, allKeywords)
+        const { error: e2 } = await db.saveKeywords(company.id, allKeywords)
+        if (e2) throw new Error(e2.message)
       } else if (step === 3) {
         const allKeywords = [
           ...keywords.map(k => ({ keyword: k, is_exclusion: false })),
           ...excludeKeywords.map(k => ({ keyword: k, is_exclusion: true })),
         ]
-        await db.saveKeywords(company.id, allKeywords)
-        await db.saveCompany(company.id, { onboarding_complete: true, onboarding_step: 4 })
+        const { error: e1 } = await db.saveKeywords(company.id, allKeywords)
+        if (e1) throw new Error(e1.message)
+        const { error: e2 } = await db.saveCompany(company.id, { onboarding_complete: true, onboarding_step: 4 })
+        if (e2) throw new Error(e2.message)
         onComplete()
         return
       }
       setStep(nextStep)
     } catch (err) {
       console.error('Save error:', err)
+      setError(err.message)
     } finally {
       setSaving(false)
     }
@@ -106,10 +121,17 @@ export default function Onboarding({ user, company, onComplete }) {
       <div style={styles.card}>
         {/* Header */}
         <div style={styles.header}>
-          <h2 style={{ color: 'var(--text)', fontSize: '20px' }}>Set up your profile</h2>
-          <p style={{ color: 'var(--muted)', fontSize: '13px', marginTop: '4px' }}>
-            Step {step + 1} of {STEPS.length} — {STEPS[step]}
-          </p>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+            <div>
+              <h2 style={{ color: 'var(--text)', fontSize: '20px' }}>Set up your profile</h2>
+              <p style={{ color: 'var(--muted)', fontSize: '13px', marginTop: '4px' }}>
+                Step {step + 1} of {STEPS.length} — {STEPS[step]}
+              </p>
+            </div>
+            <button onClick={signOut} style={{ background: 'none', color: 'var(--muted)', fontSize: '12px', padding: '4px 0' }}>
+              Sign out
+            </button>
+          </div>
         </div>
 
         {/* Progress bar */}
@@ -236,6 +258,13 @@ export default function Onboarding({ user, company, onComplete }) {
             </div>
           )}
         </div>
+
+        {/* Error display */}
+        {error && (
+          <div style={{ padding: '0 28px 8px', color: 'var(--red)', fontSize: '13px' }}>
+            {error}
+          </div>
+        )}
 
         {/* Navigation */}
         <div style={styles.footer}>

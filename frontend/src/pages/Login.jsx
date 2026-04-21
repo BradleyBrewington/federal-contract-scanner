@@ -25,21 +25,17 @@ export default function Login() {
         const userId = authData.user?.id
         if (!userId) throw new Error('Signup failed — no user returned')
 
-        // 2. Create company record
-        const { data: company, error: companyError } = await supabase
-          .from('companies')
-          .insert({ name: companyName, onboarding_complete: false, onboarding_step: 1 })
-          .select()
-          .single()
-        if (companyError) throw companyError
+        // 2. Create company + user records via backend (uses service key, bypasses RLS)
+        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5001'
+        const res = await fetch(`${apiUrl}/api/v2/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_id: userId, email, company_name: companyName }),
+        })
+        const result = await res.json()
+        if (!res.ok) throw new Error(result.error || 'Failed to create company profile')
 
-        // 3. Create user record linked to company
-        const { error: userError } = await supabase
-          .from('users')
-          .insert({ id: userId, company_id: company.id, email, role: 'admin' })
-        if (userError) throw userError
-
-        setMessage('Account created! Check your email to confirm, then sign in.')
+        setMessage('Account created! Signing you in...')
       } else {
         const { error: signInError } = await supabase.auth.signInWithPassword({ email, password })
         if (signInError) throw signInError

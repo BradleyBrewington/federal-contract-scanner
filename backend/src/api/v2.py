@@ -427,6 +427,56 @@ def get_company_profile():
 
 
 # ---------------------------------------------------------------------------
+# Registration — create company + user records using service key (bypasses RLS)
+# Called from the frontend after supabase.auth.signUp() succeeds
+# ---------------------------------------------------------------------------
+
+@app.route("/api/v2/auth/register", methods=["POST"])
+def register():
+    """
+    Creates company and user records after Supabase Auth signup.
+    Uses the service key so RLS doesn't block the inserts.
+    Expects: { user_id, email, company_name }
+    """
+    data = request.get_json()
+    user_id = data.get("user_id")
+    email = data.get("email")
+    company_name = data.get("company_name")
+
+    if not all([user_id, email, company_name]):
+        return jsonify({"error": "user_id, email, and company_name are required"}), 400
+
+    sb = get_sb()
+
+    # Check if user row already exists (idempotent)
+    existing = sb.table("users").select("id,company_id").eq("id", user_id).execute()
+    if existing.data:
+        company = sb.table("companies").select("*").eq("id", existing.data[0]["company_id"]).single().execute()
+        return jsonify({"company": company.data})
+
+    try:
+        # Create company
+        company = sb.table("companies").insert({
+            "name": company_name,
+            "onboarding_complete": False,
+            "onboarding_step": 1,
+        }).select().single().execute()
+
+        # Create user linked to company
+        sb.table("users").insert({
+            "id": user_id,
+            "company_id": company.data["id"],
+            "email": email,
+            "role": "admin",
+        }).execute()
+
+        return jsonify({"company": company.data})
+    except Exception as e:
+        logger.error(f"Registration failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 
