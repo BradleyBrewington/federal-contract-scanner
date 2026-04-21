@@ -13,10 +13,13 @@ goes React → Supabase directly, so this API stays small.
 """
 
 import os
+import re
 import json
+import random
 import base64
 import logging
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from flask import Flask, request, jsonify
@@ -220,13 +223,14 @@ def get_feed():
     swiped_ids = [s["opportunity_id"] for s in (swiped.data or [])]
 
     # Fetch candidate opportunities from Supabase
-    # Pre-filter: active, future deadline, not already swiped
+    # Pre-filter: active status, not already swiped
+    # Note: don't filter by deadline here — many valid records (awards, pre-sols,
+    # sources sought) have null deadlines. Scoring handles expired ones (returns 0).
     now_iso = datetime.now(timezone.utc).isoformat()
     query = (
         sb.table("opportunities")
         .select("id,notice_id,title,agency,sub_agency,naics_code,set_aside_type,notice_type,value_min,value_max,pop_state,response_deadline,posted_date,ai_summary,description,status,source,attachments")
         .eq("status", "active")
-        .gt("response_deadline", now_iso)
         .order("posted_date", desc=True)
         .limit(500)  # Candidate pool for scoring
     )
@@ -260,7 +264,6 @@ def get_feed():
 
     # Exploration: take from mid-range scorers
     mid = scored[top_n: top_n + 50]
-    import random
     random.shuffle(mid)
     explore_cards = [o for _, o in mid[:explore_n]]
 
@@ -271,9 +274,79 @@ def get_feed():
     final = top_cards + explore_cards + urgent_cards
     random.shuffle(final[top_n:])  # Shuffle explore/urgent so they don't cluster at the end
 
-    cards = [format_card(o, score=s) for s, o in scored if o in final]
+    # Build score lookup for final set
+    score_map = {id(o): s for s, o in scored}
+
+    # Pre-generate AI summaries for the first 6 cards that don't have one yet.
+    # This runs in parallel so latency is ~1 Haiku call (~0.5s) not 6 calls.
+    needs_summary = [o for o in final[:6] if not o.get("ai_summary")]
+    if needs_summary and ANTHROPIC_API_KEY:
+        generated = _bulk_generate_summaries(needs_summary)
+        for opp_id, summary_text in generated.items():
+            # Patch the in-memory object and cache in DB
+            for o in final:
+                if o["id"] == opp_id:
+                    o["ai_summary"] = summary_text
+            sb.table("opportunities").update({"ai_summary": summary_text}).eq("id", opp_id).execute()
+
+    cards = [format_card(o, score=score_map.get(id(o))) for o in final]
 
     return jsonify({"cards": cards, "total": len(candidates)})
+
+
+def _generate_one_summary(opp: dict) -> tuple[str, str | None]:
+    """Call Claude Haiku to generate a summary for one opportunity. Returns (opp_id, summary_text|None)."""
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        raw_desc = opp.get("description") or ""
+        desc_text = raw_desc[:600] if not raw_desc.strip().startswith("http") else ""
+        title = _clean_title(opp.get("title", ""))
+        agency = opp.get("agency", "")
+        naics = opp.get("naics_code", "")
+        notice_type = opp.get("notice_type", "")
+        set_aside = opp.get("set_aside_type", "") or ""
+        value = opp.get("value_max")
+        value_str = f"${float(value)/1e6:.1f}M" if value and float(value) >= 1e6 else (f"${float(value)/1e3:.0f}K" if value else "")
+
+        prompt = f"""Summarize this federal contract opportunity in 2–3 sentences for a business development professional.
+Focus on: what work is required, who the customer is, and any key constraints.
+Be concrete and specific. Do not start with "This opportunity" or "The government".
+
+Title: {title}
+Agency: {agency}
+Notice type: {notice_type}
+NAICS: {naics}
+{f'Set-aside: {set_aside}' if set_aside and set_aside.upper() not in ('NONE', '') else ''}
+{f'Estimated value: {value_str}' if value_str else ''}
+{f'Description: {desc_text}' if desc_text else 'No inline description — infer from title and agency context.'}
+
+Write only the summary, no preamble."""
+
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=120,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return opp["id"], response.content[0].text.strip()
+    except Exception as e:
+        logger.warning(f"Summary generation failed for {opp.get('id')}: {e}")
+        return opp["id"], None
+
+
+def _bulk_generate_summaries(opps: list) -> dict:
+    """Generate summaries for multiple opportunities in parallel. Returns {opp_id: summary}."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(len(opps), 4)) as executor:
+        futures = {executor.submit(_generate_one_summary, o): o["id"] for o in opps}
+        for future in as_completed(futures, timeout=8):
+            try:
+                opp_id, summary = future.result()
+                if summary:
+                    results[opp_id] = summary
+            except Exception as e:
+                logger.warning(f"Summary future failed: {e}")
+    return results
 
 
 def _pick_urgent(opps: list, n: int) -> list:
@@ -291,6 +364,55 @@ def _pick_urgent(opps: list, n: int) -> list:
         except ValueError:
             continue
     return urgent[:n]
+
+
+def _clean_title(title: str) -> str:
+    """Clean SAM.gov titles for human readability."""
+    text = (title or '').strip()
+    if not text:
+        return text
+    # Strip PSC/FSC prefix patterns: "47--", "J--", "R699--", "17--GUIDE,"
+    text = re.sub(r'^[A-Z0-9]{1,6}--\s*', '', text)
+    # Add space after commas if missing
+    text = re.sub(r',(?!\s)', ', ', text)
+    # Title-case if mostly uppercase (>60% uppercase alpha chars)
+    alpha = [c for c in text if c.isalpha()]
+    if alpha and sum(1 for c in alpha if c.isupper()) / len(alpha) > 0.6:
+        # Custom title case that handles acronyms better
+        words = text.split()
+        stop = {'and', 'or', 'of', 'the', 'for', 'in', 'at', 'to', 'a', 'an',
+                'with', 'on', 'by', 'from', 'its', 'as'}
+        # Known 4-5 char acronyms common in federal contracting
+        known_acronyms = {
+            'HVAC', 'USAF', 'USMC', 'USMC', 'NASA', 'DISA', 'DCSA', 'ITAR',
+            'DTRA', 'AUSA', 'SOCOM', 'NAICS', 'DARPA', 'CONUS', 'OCONUS',
+        }
+        result = []
+        for i, w in enumerate(words):
+            wl = w.lower()
+            # Treat ≤3-char all-caps or known acronyms as acronyms to preserve
+            is_acronym = (
+                w.isupper() and w.isalpha() and wl not in stop and
+                (len(w) <= 3 or w in known_acronyms)
+            )
+            if is_acronym:
+                result.append(w)
+            elif i == 0 or wl not in stop:
+                result.append(w.capitalize())
+            else:
+                result.append(wl)
+        text = ' '.join(result)
+    return text.strip() or (title or '').strip()
+
+
+def _safe_desc(text: str, max_len: int = 200) -> str:
+    """Return text truncated to max_len, or '' if it's just a URL."""
+    if not text:
+        return ""
+    text = text.strip()
+    if text.startswith("http"):
+        return ""
+    return text[:max_len]
 
 
 def format_card(opp: dict, score: int = None) -> dict:
@@ -328,7 +450,7 @@ def format_card(opp: dict, score: int = None) -> dict:
     return {
         "id": opp["id"],
         "notice_id": opp.get("notice_id"),
-        "title": opp.get("title", ""),
+        "title": _clean_title(opp.get("title", "")),
         "agency": opp.get("agency", ""),
         "naics_code": opp.get("naics_code", ""),
         "set_aside_type": opp.get("set_aside_type", ""),
@@ -340,7 +462,7 @@ def format_card(opp: dict, score: int = None) -> dict:
         "response_deadline": deadline_str,
         "posted_date": opp.get("posted_date"),
         "ai_summary": opp.get("ai_summary"),  # May be None — frontend falls back to truncated description
-        "description_preview": (opp.get("description") or "")[:200],
+        "description_preview": _safe_desc(opp.get("description"), 200),
         "has_attachments": bool(opp.get("attachments") and opp["attachments"] != "[]"),
         "score": score,
         "sam_url": f"https://sam.gov/opp/{opp.get('notice_id')}/view",
@@ -369,30 +491,13 @@ def generate_summary(opp_id: str):
     if not opp.data:
         return jsonify({"error": "Not found"}), 404
 
-    o = opp.data
-    prompt_text = f"""Write a single sentence (max 20 words) summarizing this federal contract opportunity for a BD professional.
-Title: {o.get('title', '')}
-Agency: {o.get('agency', '')}
-Description: {(o.get('description') or '')[:500]}
-Be specific about what work is involved. No fluff."""
-
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=60,
-            messages=[{"role": "user", "content": prompt_text}],
-        )
-        summary = response.content[0].text.strip()
-
-        # Cache in database
-        sb.table("opportunities").update({"ai_summary": summary}).eq("id", opp_id).execute()
-
-        return jsonify({"summary": summary})
-    except Exception as e:
-        logger.error(f"AI summary generation failed: {e}")
+    _, summary_text = _generate_one_summary(opp.data)
+    if not summary_text:
         return jsonify({"error": "Summary generation failed"}), 500
+
+    # Cache in database
+    sb.table("opportunities").update({"ai_summary": summary_text}).eq("id", opp_id).execute()
+    return jsonify({"summary": summary_text})
 
 
 # ---------------------------------------------------------------------------
@@ -456,21 +561,22 @@ def register():
 
     try:
         # Create company
-        company = sb.table("companies").insert({
+        company_result = sb.table("companies").insert({
             "name": company_name,
             "onboarding_complete": False,
             "onboarding_step": 1,
-        }).select().single().execute()
+        }).execute()
+        company_data = company_result.data[0]
 
         # Create user linked to company
         sb.table("users").insert({
             "id": user_id,
-            "company_id": company.data["id"],
+            "company_id": company_data["id"],
             "email": email,
             "role": "admin",
         }).execute()
 
-        return jsonify({"company": company.data})
+        return jsonify({"company": company_data})
     except Exception as e:
         logger.error(f"Registration failed: {e}")
         return jsonify({"error": str(e)}), 500

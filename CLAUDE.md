@@ -20,41 +20,42 @@ A multi-tenant, feed-driven federal contracting opportunity intelligence platfor
 
 ### What is built and working
 - **Monorepo structure:** `backend/` (Flask) + `frontend/` (React + Vite)
-- **Database:** Supabase PostgreSQL with full schema (companies, users, opportunities, swipes, pipeline, company_naics, company_keywords, company_agencies)
+- **Database:** Supabase PostgreSQL with full schema (companies, users, opportunities, swipes, pipeline, company_naics, company_keywords, company_agencies). **35,914 opportunities ingested.**
 - **Auth:** Supabase Auth (email/password, email confirmation disabled for dev)
-- **RLS:** Policies in place. Key fix applied: `my_company_id()` is SECURITY DEFINER. Users SELECT policy uses `id = auth.uid()` (not circular).
-- **Signup flow:** `POST /api/v2/auth/register` on Flask backend creates company + user rows using service key (bypasses RLS). Frontend calls this after Supabase Auth signup.
-- **Onboarding:** 4-step profile setup (contract size, NAICS, keywords, exclusions). Handles case where company row is missing — prompts for company name and calls register on first Continue click.
-- **Flask API v2** (`backend/src/api/v2.py`): Feed endpoint, AI summary endpoint, opportunity detail, company profile read, health check, register endpoint.
-- **Feed UI:** Tinder-style swipe deck with `react-tinder-card`. Pass/Save buttons. Dwell time tracking. Right swipes auto-added to pipeline table. Feed refills when running low.
-- **Opportunity cards:** Agency icon, title, AI summary (fetched on-demand for top card), value badge, NAICS/set-aside/location badges, urgency-colored deadline, SAM.gov link, score bar.
-- **Bulk ingestion:** `backend/src/ingestion/bulk_ingest.py` — downloads SAM.gov in two 6-month windows (API rejects ranges > ~180 days crossing year boundary), upserts to Supabase in 250-row batches. Supports `--full` and `--delta` modes.
+- **RLS:** Policies in place. `my_company_id()` is SECURITY DEFINER. Users SELECT policy uses `id = auth.uid()` (not circular).
+- **Signup flow:** `POST /api/v2/auth/register` on Flask backend creates company + user rows using service key (bypasses RLS).
+- **Onboarding:** 4-step profile setup (contract size, NAICS, keywords, exclusions). Working end-to-end.
+- **Flask API v2** (`backend/src/api/v2.py`): Feed, AI summary, opportunity detail, company profile, health check, register endpoints.
+- **Feed UI:** Tinder-style swipe deck. Cards fly off correctly on swipe (fixed). Pass/Save buttons. Right swipes auto-added to pipeline. Refills when running low.
+- **Card detail view:** Slide-up bottom sheet (`DetailModal.jsx`) with full opportunity details, AI summary, metadata grid, attachments, SAM.gov link, Pass/Save actions.
+- **AI summaries:** Pre-generated on the backend for the first 6 cards per feed load (4 parallel Haiku calls, ~1s). Cached in DB. On-demand fallback for subsequent cards. Loading spinner shown while generating.
+- **Title cleaning:** SAM.gov PSC prefixes stripped (e.g. `J--`, `47--`). All-caps converted to title case with acronym preservation (HVAC, DOD, NSA, USAF, etc.).
+- **Feed query:** Shows all active opportunities (no deadline filter — null deadlines allowed). Scoring returns 0 for expired records. 500-candidate pool, 70/20/10 mix.
+- **Bulk ingestion:** `backend/src/ingestion/bulk_ingest.py` — two 6-month windows, 250-row upsert batches, `--full` and `--delta` modes.
 - **Expiration job:** `backend/src/ingestion/expiration.py` — marks past-deadline records as expired nightly.
-- **Git + GitHub:** Repo at github.com/BradleyBrewington/Doom-Scroll-Gov-Contracts. Windows Credential Manager stores PAT for auto-push.
+- **Git + GitHub:** Repo at github.com/BradleyBrewington/Doom-Scroll-Gov-Contracts. Windows Credential Manager stores PAT.
 
 ### What is NOT yet built
-- Feed has no data yet (ingestion needs to complete successfully — see known issues)
+- Keyboard navigation on feed (arrow keys / J/K)
+- "Saved" / pipeline list page (right-swiped opportunities)
 - Pipeline Kanban board (Phase 2)
-- Keyboard navigation on feed (J/K, arrow keys)
-- Expand-to-detail view when tapping a card
-- Mobile layout polish
-- Nightly scheduled jobs (delta + expiration)
+- Nightly scheduled jobs (delta + expiration via cron/APScheduler)
 - Email alerts
 - Deployment (Railway)
+- Mobile layout polish
 
-### Known issues to fix next session
-1. **SAM.gov ingestion not yet successful** — needs to be run and confirmed. Check `data/last_ingest.txt` exists after run. Verify `opportunities` table row count in Supabase.
-2. **Feed shows empty** until ingestion completes. The feed endpoint works — it just returns 0 cards with `exhausted: true`.
-3. **`db.saveCompany` / `db.saveNaics` / `db.saveKeywords` in api.js** write directly from the browser using the anon key. These hit RLS. The UPDATE policy uses `my_company_id()` which should work now, but needs testing end-to-end through onboarding.
-4. **Onboarding completion** — the full 4-step flow has not been successfully tested end-to-end. Need to verify data lands in Supabase after each step.
-5. **`supabase.from('table')` vs `supabase.table('table')`** — Python SDK uses `.table()`, JS SDK uses `.from()`. Don't mix them.
+### Known issues / next things to verify
+1. **Onboarding data persistence** — the 4-step flow needs end-to-end verification that all data lands in Supabase (`companies`, `company_naics`, `company_keywords`). Likely works but hasn't been confirmed with data inspection.
+2. **AI summary Anthropic key** — summaries generate fine when the key is valid. If cards show spinners indefinitely, the `.env` key may be wrong or expired.
+3. **Feed score tuning** — with no NAICS/keywords set during onboarding, all opportunities score similarly. The feed works but feels random. Score improves once onboarding is complete.
+4. **DetailModal `sam_url`** — uses `notice_id` from the card payload. If `notice_id` is null for some records, the SAM.gov link will be broken.
 
 ---
 
 ## 3. Project Structure
 
 ```
-Doom-Scroll-Gov-Contracts/
+SAM_Opportunity_Search/
 ├── CLAUDE.md                          — this file
 ├── .env                               — local secrets (never committed)
 ├── .env.example                       — placeholder template
@@ -63,18 +64,17 @@ Doom-Scroll-Gov-Contracts/
 │   └── schema.sql                     — full DB schema, run once in Supabase SQL Editor
 ├── backend/
 │   ├── requirements.txt               — Python deps (Flask, supabase==2.28.3, anthropic, etc.)
-│   ├── src/
-│   │   ├── api/
-│   │   │   ├── server.py              — v1 legacy API (single-tenant, leave alone)
-│   │   │   └── v2.py                  — v2 platform API (active development)
-│   │   ├── ingestion/
-│   │   │   ├── bulk_ingest.py         — SAM.gov bulk downloader
-│   │   │   └── expiration.py          — nightly expiration job
-│   │   ├── scrapers/                  — v1 scrapers (SAM, SBIR, Grants, USASpending)
-│   │   ├── scoring/                   — v1 rule engine + AI enrichment
-│   │   ├── parsers/                   — PDF/DOCX attachment parsing
-│   │   └── notifications/             — email via SendGrid
-│   └── config/                        — v1 JSON config files
+│   └── src/
+│       ├── api/
+│       │   ├── server.py              — v1 legacy API (single-tenant, leave alone)
+│       │   └── v2.py                  — v2 platform API (active development)
+│       ├── ingestion/
+│       │   ├── bulk_ingest.py         — SAM.gov bulk downloader
+│       │   └── expiration.py          — nightly expiration job
+│       ├── scrapers/                  — v1 scrapers (leave alone)
+│       ├── scoring/                   — v1 rule engine (leave alone)
+│       ├── parsers/                   — PDF/DOCX attachment parsing
+│       └── notifications/             — email via SendGrid
 ├── frontend/
 │   ├── .env.local                     — VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY, VITE_API_URL
 │   ├── package.json
@@ -91,7 +91,8 @@ Doom-Scroll-Gov-Contracts/
 │       │   ├── Onboarding.jsx         — 4-step profile setup
 │       │   └── Feed.jsx               — swipe deck (primary surface)
 │       └── components/
-│           └── OpportunityCard.jsx    — card UI component
+│           ├── OpportunityCard.jsx    — card UI (summary, badges, deadline, expand button)
+│           └── DetailModal.jsx        — bottom sheet detail view
 ```
 
 ---
@@ -143,11 +144,11 @@ VITE_API_URL=http://localhost:5001
 
 ## 6. Supabase RLS Notes
 
-Critical: the RLS setup had a circular dependency bug that took significant time to resolve. Current working state:
+Critical — the RLS setup had a circular dependency bug that took significant time to resolve. Current working state:
 
 - `my_company_id()` — SECURITY DEFINER function, bypasses RLS when reading users table
 - `users` SELECT policy — `id = auth.uid()` (simple, no circular reference)
-- `companies` SELECT/UPDATE — uses `my_company_id()` (works now that function is SECURITY DEFINER)
+- `companies` SELECT/UPDATE — uses `my_company_id()` (works because function is SECURITY DEFINER)
 - All INSERT policies — company/user creation goes through Flask `/api/v2/auth/register` using service key, which bypasses RLS entirely. Do NOT try to insert companies or users from the browser.
 - `opportunities` — all authenticated users can read (public government data)
 
@@ -160,7 +161,7 @@ Critical: the RLS setup had a circular dependency bug that took significant time
 
 - [x] Initialize git + push to GitHub
 - [x] Database schema (Supabase PostgreSQL)
-- [x] Bulk SAM.gov ingestion pipeline (two 6-month windows)
+- [x] Bulk SAM.gov ingestion pipeline (two 6-month windows) — **35,914 records ingested**
 - [x] Expiration job
 - [x] Flask API v2 (feed, summary, detail, profile, register endpoints)
 - [x] Feed scoring engine (weighted, profile-based, no ML)
@@ -169,12 +170,14 @@ Critical: the RLS setup had a circular dependency bug that took significant time
 - [x] Onboarding (4-step, handles missing company row)
 - [x] Swipe deck UI + card component
 - [x] Right-swipe → pipeline insert
-- [ ] **Run ingestion successfully and confirm opportunities in DB**
-- [ ] **Test full onboarding flow end-to-end (all 4 steps save correctly)**
-- [ ] **Confirm feed shows cards after ingestion**
-- [ ] Card tap → expand to detail view (modal or new page)
+- [x] Swipe mechanic works (cards fly off, deck advances correctly)
+- [x] AI summaries pre-generated per feed load (parallel Haiku, cached in DB)
+- [x] Card detail bottom sheet (DetailModal)
+- [x] Title cleaning (PSC prefix removal, smart title case)
+- [x] Feed query fixed — all active records shown, not just those with future deadlines
+- [ ] **Verify onboarding saves all 4 steps to Supabase correctly**
 - [ ] Keyboard navigation (arrow keys / J/K to swipe)
-- [ ] "Liked" opportunities list page (pipeline view, simplified)
+- [ ] "Saved" opportunities list page (pipeline view)
 - [ ] Deploy to Railway
 
 ### Phase 2 — The Learning
@@ -206,7 +209,7 @@ Critical: the RLS setup had a circular dependency bug that took significant time
 | Auth | Supabase Auth | Email confirmation disabled in dev |
 | Frontend | React + Vite | v8.0.8 |
 | Swipe | react-tinder-card 1.6.4 | Requires @react-spring/web as peer dep |
-| AI summaries | Claude Haiku (claude-haiku-4-5-20251001) | On-demand, cached in DB |
+| AI summaries | Claude Haiku (claude-haiku-4-5-20251001) | Pre-generated in feed load, cached in DB |
 | Hosting | Railway (planned) | Not yet deployed |
 | Git | GitHub — BradleyBrewington/Doom-Scroll-Gov-Contracts | PAT in Windows Credential Manager |
 
@@ -225,6 +228,9 @@ Critical: the RLS setup had a circular dependency bug that took significant time
 | 2026-04-20 | SAM.gov date range max ~180 days | API returns 400 for ranges crossing year boundary; use two 6-month windows |
 | 2026-04-20 | my_company_id() as SECURITY DEFINER | Fixes circular RLS dependency between users and companies tables |
 | 2026-04-20 | Users SELECT policy: id = auth.uid() | Replaced circular company_id = my_company_id() policy |
+| 2026-04-20 | Remove deadline filter from feed query | SAM.gov records often have null deadlines (awards, pre-sols); filtering by deadline > now cut pool from 35k to ~24 records |
+| 2026-04-20 | Pre-generate summaries in feed endpoint | Lazy frontend generation caused "no description" on all cards; parallel Haiku calls add ~1s to feed load but arrive ready |
+| 2026-04-20 | Remove card from cards array on swipe | react-tinder-card bounces card back if state isn't updated; must filter swiped card out immediately in onSwipe |
 
 ---
 
@@ -232,18 +238,16 @@ Critical: the RLS setup had a circular dependency bug that took significant time
 
 **Immediate (finish Phase 1):**
 
-1. **Run ingestion** — `py -3 backend/src/ingestion/bulk_ingest.py --full` and confirm `data/last_ingest.txt` exists and Supabase `opportunities` table has rows.
+1. **Verify onboarding end-to-end** — complete all 4 steps as a new user and confirm data in Supabase: `companies` (contract_min, contract_max, clearance, set_asides), `company_naics`, `company_keywords`. This is the last unverified piece of Phase 1.
 
-2. **Test onboarding end-to-end** — complete all 4 steps and verify data in Supabase tables: `companies` (fields populated), `company_naics`, `company_keywords`.
+2. **"Saved" opportunities page** — users who right-swipe have no way to see what they saved. Build a simple list view that queries the `pipeline` table joined to `opportunities`. Add a nav tab to switch between Feed and Saved.
 
-3. **Confirm feed loads** — after ingestion, swipe deck should show cards. If still empty, debug the feed endpoint by hitting `http://localhost:5001/api/v2/feed` directly with a Bearer token.
+3. **Keyboard navigation** — arrow left/right (or J/K) to trigger swipe. Small UX win, important for desktop users.
 
-4. **Card detail view** — tapping a card should expand to show full description, all fields, attachments list, SAM.gov link. Build as a slide-up sheet or modal.
+4. **Deploy to Railway** — get it live to share with investors. Environment variables: SAM_API_KEY, ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY. Frontend env: set VITE_API_URL to the Railway backend URL.
 
-5. **Liked opportunities page** — simple list of right-swiped opportunities pulled from the `pipeline` table. Users need somewhere to see what they saved.
-
-6. **Deploy to Railway** — get it live so it can be shared with investors.
+5. **Delta ingestion + nightly cron** — set up APScheduler in v2.py (or a separate process) to run delta + expiration nightly. Otherwise the database goes stale.
 
 ---
 
-*Last updated: 2026-04-20 | Session: Phase 1 build — auth, onboarding, feed UI complete. Ingestion + end-to-end testing remaining.*
+*Last updated: 2026-04-20 | Session 3: Swipe mechanic fixed, AI summaries pre-generated, card detail modal built, title cleaning, feed query fixed (35k+ opportunities now accessible).*

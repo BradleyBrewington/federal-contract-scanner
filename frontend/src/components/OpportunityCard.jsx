@@ -10,21 +10,42 @@ const NOTICE_TYPE_LABELS = {
   combined: 'Combined',
 }
 
-export default function OpportunityCard({ card, style, isTop }) {
+export default function OpportunityCard({ card, style, isTop, onExpand }) {
   const [summary, setSummary] = useState(card.ai_summary)
+  const [summaryLoading, setSummaryLoading] = useState(false)
 
-  // Fetch AI summary on-demand if missing, but only for the top card
+  // Fetch AI summary on-demand for top 2 cards
   useEffect(() => {
-    if (!summary && isTop && card.id) {
+    if (!summary && isTop && card.id && !summaryLoading) {
+      setSummaryLoading(true)
       api.generateSummary(card.id)
         .then(res => setSummary(res.summary))
         .catch(() => {})
+        .finally(() => setSummaryLoading(false))
     }
   }, [card.id, isTop, summary])
 
   const urgencyColor = URGENCY_COLORS[card.urgency] || URGENCY_COLORS.normal
-  const displayText = summary || card.description_preview || 'No description available.'
   const noticeLabel = NOTICE_TYPE_LABELS[card.notice_type] || card.notice_type || 'Opportunity'
+
+  // Build display text: AI summary → description preview → structured fallback
+  let displayText
+  if (summary) {
+    displayText = summary
+  } else if (summaryLoading) {
+    displayText = null  // show spinner
+  } else if (card.description_preview) {
+    displayText = card.description_preview
+  } else {
+    // Structured fallback from available metadata
+    const parts = []
+    if (card.notice_type && noticeLabel !== 'Opportunity') parts.push(noticeLabel)
+    if (card.agency) parts.push(`issued by ${card.agency}`)
+    if (card.naics_code) parts.push(`NAICS ${card.naics_code}`)
+    displayText = parts.length > 0
+      ? parts.join(' · ')
+      : 'Tap Details to view the full opportunity.'
+  }
 
   return (
     <div style={{ ...styles.card, ...style }}>
@@ -46,7 +67,14 @@ export default function OpportunityCard({ card, style, isTop }) {
       <h3 style={styles.title}>{card.title}</h3>
 
       {/* Summary / description */}
-      <p style={styles.summary}>{displayText}</p>
+      {summaryLoading ? (
+        <div style={styles.summaryLoading}>
+          <div style={styles.summarySpinner} />
+          <span style={{ color: 'var(--muted)', fontSize: '12px' }}>Generating summary...</span>
+        </div>
+      ) : (
+        <p style={styles.summary}>{displayText}</p>
+      )}
 
       {/* Badges row */}
       <div style={styles.badges}>
@@ -72,15 +100,25 @@ export default function OpportunityCard({ card, style, isTop }) {
               : `${card.days_left} days left`}
           </span>
         </div>
-        <a
-          href={card.sam_url}
-          target="_blank"
-          rel="noreferrer"
-          style={styles.samLink}
-          onClick={e => e.stopPropagation()}
-        >
-          View on SAM.gov ↗
-        </a>
+        <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+          {onExpand && (
+            <button
+              onClick={e => { e.stopPropagation(); onExpand() }}
+              style={styles.expandBtn}
+            >
+              Details
+            </button>
+          )}
+          <a
+            href={card.sam_url}
+            target="_blank"
+            rel="noreferrer"
+            style={styles.samLink}
+            onClick={e => e.stopPropagation()}
+          >
+            SAM.gov ↗
+          </a>
+        </div>
       </div>
 
       {/* Score indicator (subtle) */}
@@ -168,6 +206,21 @@ const styles = {
     WebkitBoxOrient: 'vertical',
     overflow: 'hidden',
   },
+  summaryLoading: {
+    flex: 1,
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+  },
+  summarySpinner: {
+    width: '14px',
+    height: '14px',
+    border: '2px solid var(--border)',
+    borderTop: '2px solid var(--primary)',
+    borderRadius: '50%',
+    animation: 'spin 0.8s linear infinite',
+    flexShrink: 0,
+  },
   badges: { display: 'flex', flexWrap: 'wrap', gap: '6px' },
   badge: {
     padding: '3px 9px',
@@ -180,6 +233,15 @@ const styles = {
   deadlineDot: { width: '7px', height: '7px', borderRadius: '50%' },
   deadlineText: { fontSize: '12px', fontWeight: '600' },
   samLink: { fontSize: '11px', color: 'var(--muted)' },
+  expandBtn: {
+    fontSize: '11px',
+    color: 'var(--primary)',
+    background: 'none',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    fontWeight: '600',
+  },
   scoreBar: { height: '2px', background: 'var(--border)', borderRadius: '1px', marginTop: '-6px' },
   scoreFill: { height: '100%', background: 'var(--primary)', borderRadius: '1px', opacity: 0.5 },
 }

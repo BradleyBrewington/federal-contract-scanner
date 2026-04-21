@@ -45,7 +45,7 @@ export const api = {
 export const db = {
   // Record a swipe
   recordSwipe: async ({ userId, companyId, opportunityId, direction, dwellMs, expanded }) => {
-    return supabase.table('swipes').upsert({
+    return supabase.from('swipes').upsert({
       user_id: userId,
       company_id: companyId,
       opportunity_id: opportunityId,

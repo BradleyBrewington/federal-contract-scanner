@@ -20,6 +20,8 @@ export default function Onboarding({ user, company, onComplete }) {
   const [step, setStep] = useState((company?.onboarding_step || 1) - 1)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [currentCompany, setCurrentCompany] = useState(company)
+  const [companyNameInput, setCompanyNameInput] = useState(company?.name || '')
 
   // Step 1 state
   const [contractMin, setContractMin] = useState(company?.contract_min || '')
@@ -71,9 +73,23 @@ export default function Onboarding({ user, company, onComplete }) {
     setSaving(true)
     setError('')
     try {
-      if (!company?.id) throw new Error('Company not found. Try signing out and back in.')
+      // If no company yet, register first via backend
+      let companyId = currentCompany?.id
+      if (!companyId) {
+        if (!companyNameInput.trim()) throw new Error('Please enter your company name.')
+        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5001'
+        const res = await fetch(`${apiUrl}/api/v2/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_id: user.id, email: user.email, company_name: companyNameInput.trim() }),
+        })
+        const result = await res.json()
+        if (!res.ok) throw new Error(result.error || 'Failed to create company')
+        setCurrentCompany(result.company)
+        companyId = result.company.id
+      }
       if (step === 0) {
-        const { error: e } = await db.saveCompany(company.id, {
+        const { error: e } = await db.saveCompany(companyId, {
           contract_min: contractMin ? Number(contractMin) : null,
           contract_max: contractMax ? Number(contractMax) : null,
           prime_sub_preference: primeSubPref,
@@ -83,24 +99,24 @@ export default function Onboarding({ user, company, onComplete }) {
         })
         if (e) throw new Error(e.message)
       } else if (step === 1) {
-        const { error: e1 } = await db.saveNaics(company.id, naicsList)
+        const { error: e1 } = await db.saveNaics(companyId, naicsList)
         if (e1) throw new Error(e1.message)
-        const { error: e2 } = await db.saveCompany(company.id, { onboarding_step: 3 })
+        const { error: e2 } = await db.saveCompany(companyId, { onboarding_step: 3 })
         if (e2) throw new Error(e2.message)
       } else if (step === 2) {
-        const { error: e1 } = await db.saveCompany(company.id, { capabilities_statement: capStatement, onboarding_step: 4 })
+        const { error: e1 } = await db.saveCompany(companyId, { capabilities_statement: capStatement, onboarding_step: 4 })
         if (e1) throw new Error(e1.message)
         const allKeywords = keywords.map(k => ({ keyword: k, is_exclusion: false }))
-        const { error: e2 } = await db.saveKeywords(company.id, allKeywords)
+        const { error: e2 } = await db.saveKeywords(companyId, allKeywords)
         if (e2) throw new Error(e2.message)
       } else if (step === 3) {
         const allKeywords = [
           ...keywords.map(k => ({ keyword: k, is_exclusion: false })),
           ...excludeKeywords.map(k => ({ keyword: k, is_exclusion: true })),
         ]
-        const { error: e1 } = await db.saveKeywords(company.id, allKeywords)
+        const { error: e1 } = await db.saveKeywords(companyId, allKeywords)
         if (e1) throw new Error(e1.message)
-        const { error: e2 } = await db.saveCompany(company.id, { onboarding_complete: true, onboarding_step: 4 })
+        const { error: e2 } = await db.saveCompany(companyId, { onboarding_complete: true, onboarding_step: 4 })
         if (e2) throw new Error(e2.message)
         onComplete()
         return
@@ -143,6 +159,17 @@ export default function Onboarding({ user, company, onComplete }) {
         <div style={styles.body}>
           {step === 0 && (
             <div style={styles.fields}>
+              {!currentCompany?.id && (
+                <Row label="Company name">
+                  <input
+                    type="text"
+                    placeholder="Acme Defense Solutions"
+                    value={companyNameInput}
+                    onChange={e => setCompanyNameInput(e.target.value)}
+                    required
+                  />
+                </Row>
+              )}
               <Row label="Contract size range">
                 <div style={styles.rangeRow}>
                   <input type="number" placeholder="Min $" value={contractMin} onChange={e => setContractMin(e.target.value)} />

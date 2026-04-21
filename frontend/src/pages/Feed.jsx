@@ -1,17 +1,21 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import TinderCard from 'react-tinder-card'
 import OpportunityCard from '../components/OpportunityCard'
+import DetailModal from '../components/DetailModal'
 import { api, db } from '../lib/api'
 
 export default function Feed({ user, company }) {
   const [cards, setCards] = useState([])
   const [loading, setLoading] = useState(true)
   const [exhausted, setExhausted] = useState(false)
-  const [currentIndex, setCurrentIndex] = useState(0)
   const [lastSwipe, setLastSwipe] = useState(null)  // { direction, title }
   const [swipeCount, setSwipeCount] = useState(0)
+  const [expandedCard, setExpandedCard] = useState(null)
   const cardRefs = useRef([])
   const swipeStartTime = useRef(null)
+
+  // Top card is always the last element in the array
+  const currentIndex = cards.length - 1
 
   const loadFeed = useCallback(async () => {
     setLoading(true)
@@ -20,9 +24,12 @@ export default function Feed({ user, company }) {
       if (data.exhausted || !data.cards?.length) {
         setExhausted(true)
       } else {
-        setCards(data.cards)
-        setCurrentIndex(data.cards.length - 1)
-        cardRefs.current = data.cards.map(() => null)
+        setCards(prev => {
+          // Append new cards, avoiding duplicates
+          const existingIds = new Set(prev.map(c => c.id))
+          const fresh = data.cards.filter(c => !existingIds.has(c.id))
+          return [...fresh, ...prev]
+        })
       }
     } catch (err) {
       console.error('Feed load failed:', err)
@@ -40,12 +47,19 @@ export default function Feed({ user, company }) {
     swipeStartTime.current = Date.now()
   }, [currentIndex])
 
-  const onSwipe = useCallback(async (direction, card, index) => {
+  const onSwipe = useCallback(async (direction, card) => {
     const dwellMs = swipeStartTime.current ? Date.now() - swipeStartTime.current : null
 
     setLastSwipe({ direction, title: card.title })
-    setCurrentIndex(prev => prev - 1)
     setSwipeCount(prev => prev + 1)
+
+    // Remove card from deck — this advances to the next card
+    setCards(prev => prev.filter(c => c.id !== card.id))
+
+    // Load more when running low (cards.length - 1 = deck size after this swipe)
+    if (cards.length - 1 <= 3 && !exhausted) {
+      loadFeed()
+    }
 
     // Record swipe in Supabase
     db.recordSwipe({
@@ -65,12 +79,7 @@ export default function Feed({ user, company }) {
         userId: user.id,
       }).catch(err => console.error('Pipeline add failed:', err))
     }
-
-    // Load more when we're running low (3 cards left)
-    if (index <= 3 && !exhausted) {
-      loadFeed()
-    }
-  }, [user, company, exhausted, loadFeed])
+  }, [user, company, cards.length, exhausted, loadFeed])
 
   // Programmatic swipe via buttons
   const swipe = async (direction) => {
@@ -87,7 +96,7 @@ export default function Feed({ user, company }) {
     )
   }
 
-  if (exhausted && currentIndex < 0) {
+  if (exhausted && cards.length === 0) {
     return (
       <div style={styles.centered}>
         <p style={{ fontSize: '40px' }}>🎉</p>
@@ -124,7 +133,7 @@ export default function Feed({ user, company }) {
           <TinderCard
             key={card.id}
             ref={el => cardRefs.current[index] = el}
-            onSwipe={(dir) => onSwipe(dir, card, index)}
+            onSwipe={(dir) => onSwipe(dir, card)}
             preventSwipe={['up', 'down']}
             swipeRequirementType="position"
             swipeThreshold={80}
@@ -132,6 +141,7 @@ export default function Feed({ user, company }) {
             <OpportunityCard
               card={card}
               isTop={index === currentIndex}
+              onExpand={() => setExpandedCard(card)}
               style={{
                 transform: index === currentIndex
                   ? 'scale(1)'
@@ -150,11 +160,28 @@ export default function Feed({ user, company }) {
       {/* Action buttons */}
       <div style={styles.actions}>
         <ActionBtn onClick={() => swipe('left')} color="#ef4444" label="Pass">✕</ActionBtn>
+        <ActionBtn
+          onClick={() => setExpandedCard(cards[currentIndex])}
+          color="#6366f1"
+          label="Details"
+        >
+          ⓘ
+        </ActionBtn>
         <ActionBtn onClick={() => swipe('right')} color="#22c55e" label="Save" large>✓</ActionBtn>
       </div>
 
       {/* Keyboard hint */}
       <p style={styles.hint}>← Pass &nbsp;&nbsp; Save →</p>
+
+      {/* Detail modal */}
+      {expandedCard && (
+        <DetailModal
+          card={expandedCard}
+          onClose={() => setExpandedCard(null)}
+          onPass={() => { swipe('left'); setExpandedCard(null) }}
+          onSave={() => { swipe('right'); setExpandedCard(null) }}
+        />
+      )}
     </div>
   )
 }
