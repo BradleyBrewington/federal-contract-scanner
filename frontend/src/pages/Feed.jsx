@@ -4,6 +4,7 @@ import OpportunityCard from '../components/OpportunityCard'
 import DetailModal from '../components/DetailModal'
 import { api, db } from '../lib/api'
 
+const SWIPE_HISTORY_MAX = 3  // How many swipes can be undone
 const SESSION_SWIPE_KEY = 'govscroll_swipe_count'
 const SESSION_CARDS_TS_KEY = 'govscroll_cards_ts'
 const QUEUE_MAX_AGE_MS = 4 * 60 * 60 * 1000  // 4 hours — stale after this
@@ -38,6 +39,7 @@ export default function Feed({ user, company }) {
     () => parseInt(sessionStorage.getItem(SESSION_SWIPE_KEY) || '0', 10)
   )
   const [expandedCard, setExpandedCard] = useState(null)
+  const [swipeHistory, setSwipeHistory] = useState([]) // [{card, direction}, ...] newest last
   const cardRefs = useRef([])
   const swipeStartTime = useRef(null)
 
@@ -109,6 +111,9 @@ export default function Feed({ user, company }) {
     setLastSwipe({ direction, title: card.title })
     setSwipeCount(prev => prev + 1)
 
+    // Push to undo history (keep last SWIPE_HISTORY_MAX)
+    setSwipeHistory(prev => [...prev.slice(-(SWIPE_HISTORY_MAX - 1)), { card, direction }])
+
     // Remove card from deck
     setCards(prev => prev.filter(c => c.id !== card.id))
 
@@ -134,6 +139,42 @@ export default function Feed({ user, company }) {
       }).catch(err => console.error('Pipeline add failed:', err))
     }
   }, [user, company, cards.length, exhausted, loadFeed])
+
+  const handleUndo = useCallback(() => {
+    if (swipeHistory.length === 0) return
+    const last = swipeHistory[swipeHistory.length - 1]
+    setSwipeHistory(prev => prev.slice(0, -1))
+
+    // Put card back on top of deck
+    setCards(prev => [...prev, last.card])
+    setSwipeCount(prev => Math.max(0, prev - 1))
+    setLastSwipe(null)
+
+    // Remove swipe record from DB
+    db.deleteSwipe({ userId: user.id, opportunityId: last.card.id })
+      .catch(err => console.error('Undo swipe delete failed:', err))
+
+    // If it was a right-swipe, remove from pipeline too
+    if (last.direction === 'right') {
+      db.removeFromPipeline({ companyId: company.id, opportunityId: last.card.id })
+        .catch(err => console.error('Undo pipeline remove failed:', err))
+    }
+  }, [swipeHistory, user.id, company.id])
+
+  const handleBookmark = useCallback(() => {
+    const card = cards[currentIndex]
+    if (!card) return
+
+    // Remove from deck without recording a swipe — bookmark is a distinct signal
+    setCards(prev => prev.filter(c => c.id !== card.id))
+    setLastSwipe({ direction: 'bookmark', title: card.title })
+
+    db.addBookmark({
+      companyId: company.id,
+      opportunityId: card.id,
+      userId: user.id,
+    }).catch(err => console.error('Bookmark failed:', err))
+  }, [cards, currentIndex, company.id, user.id])
 
   const swipe = async (direction) => {
     const ref = cardRefs.current[currentIndex]
@@ -195,11 +236,19 @@ export default function Feed({ user, company }) {
       {lastSwipe && (
         <div style={{
           ...styles.swipeFeedback,
-          background: lastSwipe.direction === 'right' ? '#22c55e22' : '#ef444422',
-          color: lastSwipe.direction === 'right' ? '#22c55e' : '#ef4444',
-          borderColor: lastSwipe.direction === 'right' ? '#22c55e44' : '#ef444444',
+          background: lastSwipe.direction === 'right' ? '#22c55e22'
+            : lastSwipe.direction === 'bookmark' ? '#6366f122'
+            : '#ef444422',
+          color: lastSwipe.direction === 'right' ? '#22c55e'
+            : lastSwipe.direction === 'bookmark' ? '#6366f1'
+            : '#ef4444',
+          borderColor: lastSwipe.direction === 'right' ? '#22c55e44'
+            : lastSwipe.direction === 'bookmark' ? '#6366f144'
+            : '#ef444444',
         }}>
-          {lastSwipe.direction === 'right' ? '✓ Added to pipeline' : '✕ Passed'}
+          {lastSwipe.direction === 'right' ? '✓ Added to pipeline'
+            : lastSwipe.direction === 'bookmark' ? '🔖 Bookmarked'
+            : '✕ Passed'}
         </div>
       )}
 
@@ -236,19 +285,24 @@ export default function Feed({ user, company }) {
 
       {/* Action buttons */}
       <div style={styles.actions}>
+        <ActionBtn
+          onClick={handleUndo}
+          color="#8888a0"
+          label="Undo"
+          disabled={swipeHistory.length === 0}
+        >↩</ActionBtn>
         <ActionBtn onClick={() => swipe('left')} color="#ef4444" label="Pass">✕</ActionBtn>
+        <ActionBtn onClick={() => swipe('right')} color="#22c55e" label="Save" large>✓</ActionBtn>
+        <ActionBtn onClick={handleBookmark} color="#6366f1" label="Bookmark">🔖</ActionBtn>
         <ActionBtn
           onClick={() => cards[currentIndex] && handleExpand(cards[currentIndex])}
-          color="#6366f1"
+          color="#8888a0"
           label="Details"
-        >
-          ⓘ
-        </ActionBtn>
-        <ActionBtn onClick={() => swipe('right')} color="#22c55e" label="Save" large>✓</ActionBtn>
+        >ⓘ</ActionBtn>
       </div>
 
       {/* Keyboard hint */}
-      <p style={styles.hint}>← Pass &nbsp;&nbsp; Save →</p>
+      <p style={styles.hint}>← Pass &nbsp;&nbsp; Save → &nbsp;&nbsp; ↩ Undo</p>
 
       {/* Detail modal */}
       {expandedCard && (
@@ -263,24 +317,27 @@ export default function Feed({ user, company }) {
   )
 }
 
-function ActionBtn({ onClick, color, label, large, children }) {
+function ActionBtn({ onClick, color, label, large, disabled, children }) {
   return (
     <button
       onClick={onClick}
       title={label}
+      disabled={disabled}
       style={{
         width: large ? '64px' : '52px',
         height: large ? '64px' : '52px',
         borderRadius: '50%',
-        background: color + '22',
-        color,
-        border: `2px solid ${color}44`,
+        background: disabled ? 'var(--surface2)' : color + '22',
+        color: disabled ? 'var(--border)' : color,
+        border: `2px solid ${disabled ? 'var(--border)' : color + '44'}`,
         fontSize: large ? '22px' : '18px',
         fontWeight: '700',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         transition: 'all 0.15s',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.5 : 1,
       }}
     >
       {children}

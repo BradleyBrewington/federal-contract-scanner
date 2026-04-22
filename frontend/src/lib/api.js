@@ -92,6 +92,31 @@ export const db = {
     return Promise.resolve()
   },
 
+  // Delete a swipe record (used by undo)
+  deleteSwipe: async ({ userId, opportunityId }) => {
+    return supabase.from('swipes')
+      .delete()
+      .eq('user_id', userId)
+      .eq('opportunity_id', opportunityId)
+  },
+
+  // Remove an opportunity from the pipeline (used by undo when undoing a right-swipe)
+  removeFromPipeline: async ({ companyId, opportunityId }) => {
+    return supabase.from('pipeline')
+      .delete()
+      .eq('company_id', companyId)
+      .eq('opportunity_id', opportunityId)
+  },
+
+  // Bookmark an opportunity — distinct signal from pipeline save
+  addBookmark: async ({ companyId, opportunityId, userId }) => {
+    return supabase.from('bookmarks').upsert({
+      company_id: companyId,
+      opportunity_id: opportunityId,
+      user_id: userId,
+    }, { onConflict: 'company_id,opportunity_id' })
+  },
+
   // Get pipeline for company
   getPipeline: async (companyId) => {
     return supabase.from('pipeline')
