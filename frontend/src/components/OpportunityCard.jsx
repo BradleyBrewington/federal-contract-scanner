@@ -31,7 +31,7 @@ const FLAG_COLORS = {
 }
 const FLAG_ICONS = { clearance: '🔒', cert: '📋', vehicle: '🔗', sole: '⚠️' }
 
-export default function OpportunityCard({ card, style, isTop, preload, onExpand }) {
+export default function OpportunityCard({ card, style, isTop, preload, onExpand, onSave }) {
   const [aiScope, setAiScope] = useState(card.ai_summary)
 
   // Pre-warm AI scope description for top 3 cards
@@ -145,7 +145,17 @@ export default function OpportunityCard({ card, style, isTop, preload, onExpand 
         )}
       </div>
 
-      {/* Footer: deadline + actions */}
+      {/* Save button — sits in dead space above footer, only shown when onSave provided */}
+      {onSave && (
+        <button
+          onClick={e => { e.stopPropagation(); onSave() }}
+          style={styles.saveBtn}
+        >
+          ✓ Save to Pipeline
+        </button>
+      )}
+
+      {/* Footer: deadline + details link */}
       <div style={styles.footer}>
         <div style={styles.deadlineRow}>
           <div style={{ ...styles.deadlineDot, background: urgencyColor }} />
@@ -270,10 +280,23 @@ const styles = {
     WebkitBoxOrient: 'vertical', overflow: 'hidden',
   },
 
+  // Save button — fills dead space between data rows and footer
+  saveBtn: {
+    marginTop: 'auto',
+    padding: '10px',
+    background: 'var(--primary)',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '10px',
+    fontSize: '13px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    width: '100%',
+  },
+
   // Footer
   footer: {
     display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-    marginTop: 'auto',
   },
   deadlineRow: { display: 'flex', alignItems: 'center', gap: '6px' },
   deadlineDot: { width: '7px', height: '7px', borderRadius: '50%', flexShrink: 0 },

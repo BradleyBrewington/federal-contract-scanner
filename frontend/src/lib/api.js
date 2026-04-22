@@ -120,7 +120,7 @@ export const db = {
   // Get pipeline for company
   getPipeline: async (companyId) => {
     return supabase.from('pipeline')
-      .select('*, opportunities(id,title,agency,naics_code,set_aside_type,response_deadline,value_max,ai_summary)')
+      .select('*, opportunities(id,notice_id,title,agency,sub_agency,naics_code,set_aside_type,response_deadline,value_max,ai_summary)')
       .eq('company_id', companyId)
       .order('created_at', { ascending: false })
   },
