@@ -1373,6 +1373,14 @@ def format_card(opp: dict, score: int = None) -> dict:
     location = ", ".join(filter(None, [pop_city, pop_state]))
     # Description-derived fields
     raw_desc = opp.get("description", "") or ""
+    # Some records store description as a JSON object {"description": "..."}
+    if raw_desc.strip().startswith("{"):
+        try:
+            parsed_json = json.loads(raw_desc)
+            if isinstance(parsed_json, dict):
+                raw_desc = parsed_json.get("description") or parsed_json.get("body") or raw_desc
+        except Exception:
+            pass
     set_aside = opp.get("set_aside_type", "") or ""
     flags = _extract_flags(raw_desc, set_aside)
     parsed_scope = _parse_scope(raw_desc)
