@@ -59,6 +59,13 @@ export default function Feed({ user, company }) {
       .catch(() => {})
   }, [user?.id])
 
+  // Auto-dismiss swipe feedback after 1.5s so it doesn't displace the action buttons
+  useEffect(() => {
+    if (!lastSwipe) return
+    const t = setTimeout(() => setLastSwipe(null), 1500)
+    return () => clearTimeout(t)
+  }, [lastSwipe])
+
   // Persist card queue to sessionStorage after every change so tab restores work
   useEffect(() => {
     if (cards.length > 0) {
@@ -232,7 +239,7 @@ export default function Feed({ user, company }) {
         <div style={styles.swipeCount}>{swipeCount} reviewed today</div>
       </div>
 
-      {/* Swipe feedback flash */}
+      {/* Swipe feedback flash — absolutely positioned so it never shifts the layout */}
       {lastSwipe && (
         <div style={{
           ...styles.swipeFeedback,
@@ -251,6 +258,7 @@ export default function Feed({ user, company }) {
             : '✕ Passed'}
         </div>
       )}
+
 
       {/* Card stack */}
       <div style={styles.deck}>
@@ -347,6 +355,7 @@ function ActionBtn({ onClick, color, label, large, disabled, children }) {
 
 const styles = {
   page: {
+    position: 'relative',
     height: '100%',
     display: 'flex',
     flexDirection: 'column',
@@ -372,11 +381,15 @@ const styles = {
     border: '1px solid var(--border)',
   },
   swipeFeedback: {
+    position: 'absolute',
+    top: '80px',         // sits below the header, over the deck
+    zIndex: 200,
     fontSize: '13px',
     fontWeight: '600',
     padding: '6px 14px',
     borderRadius: '20px',
     border: '1px solid',
+    pointerEvents: 'none',
   },
   deck: {
     position: 'relative',
