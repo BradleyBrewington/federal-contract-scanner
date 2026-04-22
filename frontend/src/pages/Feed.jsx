@@ -279,75 +279,79 @@ export default function Feed({ user, company }) {
     <div style={styles.pageShell}>
 
       {view === 'feed' ? (
-        <div style={styles.feedContent}>
+        <>
+          {/* feedContent only holds header + deck — overflow:hidden clips card animations
+              but must NOT contain the action buttons or they get clipped too */}
+          <div style={styles.feedContent}>
 
-          {/* Header */}
-          <div style={styles.header}>
-            <h2 style={styles.headerTitle}>Your Feed</h2>
-            <div style={styles.swipeCount}>{swipeCount} reviewed today</div>
-          </div>
-
-          {/* Swipe feedback — absolutely positioned, never shifts layout */}
-          {lastSwipe && (
-            <div style={{
-              ...styles.swipeFeedback,
-              background: lastSwipe.direction === 'right' ? '#22c55e22'
-                : lastSwipe.direction === 'bookmark' ? '#6366f122'
-                : '#ef444422',
-              color: lastSwipe.direction === 'right' ? '#22c55e'
-                : lastSwipe.direction === 'bookmark' ? '#6366f1'
-                : '#ef4444',
-              borderColor: lastSwipe.direction === 'right' ? '#22c55e44'
-                : lastSwipe.direction === 'bookmark' ? '#6366f144'
-                : '#ef444444',
-            }}>
-              {lastSwipe.direction === 'right' ? '✓ Saved'
-                : lastSwipe.direction === 'bookmark' ? '🔖 Bookmarked'
-                : '✕ Passed'}
+            {/* Header */}
+            <div style={styles.header}>
+              <h2 style={styles.headerTitle}>Your Feed</h2>
+              <div style={styles.swipeCount}>{swipeCount} reviewed today</div>
             </div>
-          )}
 
-          {/* Card stack */}
-          <div style={styles.deck}>
-            {cards.map((card, index) => {
-              const isSaving = card.id === savingCardId
-              return (
-                <TinderCard
-                  key={card.id}
-                  ref={el => cardRefs.current[index] = el}
-                  onSwipe={(dir) => onSwipe(dir, card)}
-                  preventSwipe={['up', 'down']}
-                  swipeRequirementType="position"
-                  swipeThreshold={80}
-                >
-                  <OpportunityCard
-                    card={card}
-                    isTop={index === currentIndex}
-                    preload={index >= currentIndex - 2}
-                    onExpand={() => handleExpand(card)}
-                    onSave={() => handleSave(card)}
-                    style={{
-                      transform: isSaving
-                        ? 'scale(0.78) translateY(72px)'
-                        : index === currentIndex
-                        ? 'scale(1)'
-                        : index === currentIndex - 1
-                        ? 'scale(0.96) translateY(12px)'
-                        : 'scale(0.92) translateY(24px)',
-                      opacity: isSaving ? 0
-                        : index < currentIndex - 2 ? 0 : 1,
-                      zIndex: isSaving ? 50 : index,
-                      transition: isSaving
-                        ? `transform ${SAVE_ANIM_MS}ms cubic-bezier(0.4, 0, 1, 1), opacity ${SAVE_ANIM_MS * 0.8}ms ease`
-                        : 'transform 0.2s ease, opacity 0.2s ease',
-                    }}
-                  />
-                </TinderCard>
-              )
-            })}
+            {/* Swipe feedback — absolutely positioned inside feedContent */}
+            {lastSwipe && (
+              <div style={{
+                ...styles.swipeFeedback,
+                background: lastSwipe.direction === 'right' ? '#22c55e22'
+                  : lastSwipe.direction === 'bookmark' ? '#6366f122'
+                  : '#ef444422',
+                color: lastSwipe.direction === 'right' ? '#22c55e'
+                  : lastSwipe.direction === 'bookmark' ? '#6366f1'
+                  : '#ef4444',
+                borderColor: lastSwipe.direction === 'right' ? '#22c55e44'
+                  : lastSwipe.direction === 'bookmark' ? '#6366f144'
+                  : '#ef444444',
+              }}>
+                {lastSwipe.direction === 'right' ? '✓ Saved'
+                  : lastSwipe.direction === 'bookmark' ? '🔖 Bookmarked'
+                  : '✕ Passed'}
+              </div>
+            )}
+
+            {/* Card stack */}
+            <div style={styles.deck}>
+              {cards.map((card, index) => {
+                const isSaving = card.id === savingCardId
+                return (
+                  <TinderCard
+                    key={card.id}
+                    ref={el => cardRefs.current[index] = el}
+                    onSwipe={(dir) => onSwipe(dir, card)}
+                    preventSwipe={['up', 'down']}
+                    swipeRequirementType="position"
+                    swipeThreshold={80}
+                  >
+                    <OpportunityCard
+                      card={card}
+                      isTop={index === currentIndex}
+                      preload={index >= currentIndex - 2}
+                      onExpand={() => handleExpand(card)}
+                      onSave={() => handleSave(card)}
+                      style={{
+                        transform: isSaving
+                          ? 'scale(0.78) translateY(72px)'
+                          : index === currentIndex
+                          ? 'scale(1)'
+                          : index === currentIndex - 1
+                          ? 'scale(0.96) translateY(12px)'
+                          : 'scale(0.92) translateY(24px)',
+                        opacity: isSaving ? 0
+                          : index < currentIndex - 2 ? 0 : 1,
+                        zIndex: isSaving ? 50 : index,
+                        transition: isSaving
+                          ? `transform ${SAVE_ANIM_MS}ms cubic-bezier(0.4, 0, 1, 1), opacity ${SAVE_ANIM_MS * 0.8}ms ease`
+                          : 'transform 0.2s ease, opacity 0.2s ease',
+                      }}
+                    />
+                  </TinderCard>
+                )
+              })}
+            </div>
           </div>
 
-          {/* Secondary actions — undo and bookmark only */}
+          {/* Actions live OUTSIDE feedContent so overflow:hidden never clips them */}
           <div style={styles.actions}>
             <ActionBtn
               onClick={handleUndo}
@@ -359,8 +363,7 @@ export default function Feed({ user, company }) {
           </div>
 
           <p style={styles.hint}>← swipe to pass &nbsp;·&nbsp; ↩ undo</p>
-
-        </div>
+        </>
       ) : (
         <SavedList
           company={company}
