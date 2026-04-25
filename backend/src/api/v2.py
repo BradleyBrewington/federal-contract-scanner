@@ -14,6 +14,7 @@ goes React → Supabase directly, so this API stays small.
 
 import os
 import re
+import sys
 import json
 import math
 import time
@@ -2112,9 +2113,53 @@ def handle_exception(e):
     return response
 
 
+def _run_nightly_jobs():
+    """
+    Nightly maintenance: delta ingestion + expiration.
+    Called by APScheduler at 2 AM UTC. Uses subprocess so the ingestion
+    scripts run in their own process with their own DB connections.
+    """
+    import subprocess
+    project_root = Path(__file__).resolve().parents[3]
+    ingest_script = project_root / "backend" / "src" / "ingestion" / "bulk_ingest.py"
+    expire_script = project_root / "backend" / "src" / "ingestion" / "expiration.py"
+
+    logger.info("Nightly job: starting delta ingestion")
+    try:
+        subprocess.run(
+            [sys.executable, str(ingest_script), "--delta"],
+            check=True, timeout=3600,
+        )
+        logger.info("Nightly job: delta ingestion complete")
+    except Exception as e:
+        logger.error(f"Nightly job: delta ingestion failed: {e}")
+
+    logger.info("Nightly job: starting expiration check")
+    try:
+        subprocess.run(
+            [sys.executable, str(expire_script)],
+            check=True, timeout=300,
+        )
+        logger.info("Nightly job: expiration complete")
+    except Exception as e:
+        logger.error(f"Nightly job: expiration failed: {e}")
+
+
 if __name__ == "__main__":
+    from apscheduler.schedulers.background import BackgroundScheduler
+
     port = int(os.getenv("PORT", 5001))
+
+    # Start nightly scheduler unless explicitly disabled (e.g. during testing).
+    # Runs delta ingestion + expiration at 02:00 UTC daily.
+    if not os.getenv("DISABLE_SCHEDULER"):
+        scheduler = BackgroundScheduler(timezone="UTC")
+        scheduler.add_job(_run_nightly_jobs, "cron", hour=2, minute=0)
+        scheduler.start()
+        logger.info("Nightly scheduler started (delta + expiration at 02:00 UTC)")
+
     logger.info(f"Starting Platform API v2 on port {port}")
-    # debug=False prevents the Werkzeug reloader from spawning a child process,
-    # which conflicts with ThreadPoolExecutor and causes connection drops on Windows.
-    app.run(host="127.0.0.1", port=port, debug=False)
+    # host="0.0.0.0" required for Railway (and fine locally — dev server, not production).
+    # debug=False prevents the Werkzeug reloader spawning a child process, which
+    # conflicts with ThreadPoolExecutor and causes connection drops on Windows.
+    app.run(host="0.0.0.0", port=port, debug=False)

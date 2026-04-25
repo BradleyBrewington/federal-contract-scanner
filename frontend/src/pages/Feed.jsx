@@ -179,10 +179,10 @@ export default function Feed({ user, company }) {
     }, SAVE_ANIM_MS)
   }, [user, company, cards.length, exhausted, loadFeed])
 
-  const swipe = async (direction) => {
+  const swipe = useCallback(async (direction) => {
     const ref = cardRefs.current[currentIndex]
     if (ref) await ref.swipe(direction)
-  }
+  }, [currentIndex])
 
   const handleUndo = useCallback(() => {
     if (swipeHistory.length === 0) return
@@ -212,6 +212,20 @@ export default function Feed({ user, company }) {
       userId: user.id,
     }).catch(err => console.error('Bookmark failed:', err))
   }, [cards, currentIndex, company.id, user.id])
+
+  // Keyboard navigation: ← / J = pass, → / L = save, Z = undo
+  useEffect(() => {
+    if (view !== 'feed') return
+    const handler = (e) => {
+      if (expandedCard) return
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+      if (e.key === 'ArrowLeft'  || e.key === 'j') swipe('left')
+      if (e.key === 'ArrowRight' || e.key === 'l') swipe('right')
+      if (e.key === 'z') handleUndo()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [view, expandedCard, swipe, handleUndo])
 
   const handleExpand = useCallback((card) => {
     setExpandedCard(card)
@@ -349,7 +363,7 @@ export default function Feed({ user, company }) {
             <ActionBtn onClick={handleBookmark} color="#6366f1" label="Bookmark">🔖</ActionBtn>
           </div>
 
-          <p style={styles.hint}>← swipe to pass &nbsp;·&nbsp; ↩ undo</p>
+          <p style={styles.hint}>← / J pass &nbsp;·&nbsp; → / L save &nbsp;·&nbsp; Z undo</p>
         </>
       ) : view === 'liked' ? (
         <SavedList
