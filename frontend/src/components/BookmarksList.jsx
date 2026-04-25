@@ -22,13 +22,13 @@ function valueDisplay(max) {
   return `$${v}`
 }
 
-export default function SavedList({ company, onRemove }) {
+export default function BookmarksList({ company, onRemove }) {
   const [items, setItems] = useState([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     if (!company?.id) return
-    db.getPipeline(company.id)
+    db.getBookmarks(company.id)
       .then(({ data }) => setItems(data || []))
       .catch(console.error)
       .finally(() => setLoading(false))
@@ -36,8 +36,8 @@ export default function SavedList({ company, onRemove }) {
 
   const handleRemove = (item) => {
     setItems(prev => prev.filter(i => i.id !== item.id))
-    onRemove?.(item.opportunity_id)
-    db.removeFromPipeline({ companyId: company.id, opportunityId: item.opportunity_id })
+    onRemove?.()
+    db.removeBookmark({ companyId: company.id, opportunityId: item.opportunity_id })
       .catch(console.error)
   }
 
@@ -52,16 +52,16 @@ export default function SavedList({ company, onRemove }) {
   if (!items.length) {
     return (
       <div style={styles.centered}>
-        <p style={{ fontSize: '36px' }}>👍</p>
-        <h3 style={styles.emptyTitle}>Nothing liked yet</h3>
-        <p style={styles.emptyText}>Swipe right or tap Save on a card to add opportunities here.</p>
+        <p style={{ fontSize: '36px' }}>🔖</p>
+        <h3 style={styles.emptyTitle}>No bookmarks yet</h3>
+        <p style={styles.emptyText}>Tap the bookmark button on a card to save it here for later.</p>
       </div>
     )
   }
 
   return (
     <div style={styles.list}>
-      <p style={styles.countLabel}>{items.length} saved</p>
+      <p style={styles.countLabel}>{items.length} bookmarked</p>
       {items.map(item => {
         const opp = item.opportunities
         if (!opp) return null
@@ -178,7 +178,7 @@ const styles = {
   itemHeader: { display: 'flex', alignItems: 'center', gap: '10px' },
   agencyIcon: {
     width: '30px', height: '30px', borderRadius: '7px',
-    background: 'var(--primary)', color: '#fff',
+    background: '#6366f1', color: '#fff',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     fontWeight: '700', fontSize: '13px', flexShrink: 0,
   },

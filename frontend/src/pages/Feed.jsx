@@ -3,6 +3,7 @@ import TinderCard from 'react-tinder-card'
 import OpportunityCard from '../components/OpportunityCard'
 import DetailModal from '../components/DetailModal'
 import SavedList from '../components/SavedList'
+import BookmarksList from '../components/BookmarksList'
 import { api, db } from '../lib/api'
 
 const SWIPE_HISTORY_MAX = 3
@@ -11,7 +12,7 @@ const SESSION_CARDS_TS_KEY = 'govscroll_cards_ts'
 const QUEUE_MAX_AGE_MS = 4 * 60 * 60 * 1000
 
 // Bump this when card payload schema changes to auto-invalidate old caches
-const CARD_SCHEMA_VERSION = 5
+const CARD_SCHEMA_VERSION = 6
 const SESSION_CARDS_KEY = `govscroll_cards_v${CARD_SCHEMA_VERSION}`
 
 const SAVE_ANIM_MS = 360  // Duration of the shrink-and-sink animation
@@ -36,17 +37,18 @@ export default function Feed({ user, company }) {
   const [loading, setLoading] = useState(!savedCards.current)
   const [exhausted, setExhausted] = useState(false)
   const [loadError, setLoadError] = useState(false)
-  const [lastSwipe, setLastSwipe] = useState(null)
   const [swipeCount, setSwipeCount] = useState(
     () => parseInt(sessionStorage.getItem(SESSION_SWIPE_KEY) || '0', 10)
   )
   const [expandedCard, setExpandedCard] = useState(null)
   const [swipeHistory, setSwipeHistory] = useState([])
   const [savingCardId, setSavingCardId] = useState(null)  // triggers shrink-and-sink anim
-  const [view, setView] = useState('feed')                // 'feed' | 'saved'
+  const [view, setView] = useState('feed')                // 'feed' | 'liked' | 'bookmarks'
   const [savedCount, setSavedCount] = useState(0)
+  const [bookmarkCount, setBookmarkCount] = useState(0)
 
-  const cardRefs = useRef([])
+  const cardRefs     = useRef([])  // TinderCard refs (for programmatic swipe)
+  const cardHintRefs = useRef([])  // OpportunityCard refs (for imperative setHint)
   const swipeStartTime = useRef(null)
 
   const currentIndex = cards.length - 1
@@ -62,11 +64,14 @@ export default function Feed({ user, company }) {
       .catch(() => {})
   }, [user?.id])
 
-  // Load saved count for the tab badge
+  // Load liked + bookmark counts for tab badges
   useEffect(() => {
     if (!company?.id) return
     db.getPipeline(company.id)
       .then(({ data }) => setSavedCount((data || []).length))
+      .catch(() => {})
+    db.getBookmarks(company.id)
+      .then(({ data }) => setBookmarkCount((data || []).length))
       .catch(() => {})
   }, [company?.id])
 
@@ -79,12 +84,6 @@ export default function Feed({ user, company }) {
     }
   }, [cards])
 
-  // Auto-dismiss swipe feedback after 1.5s
-  useEffect(() => {
-    if (!lastSwipe) return
-    const t = setTimeout(() => setLastSwipe(null), 1500)
-    return () => clearTimeout(t)
-  }, [lastSwipe])
 
   const loadFeed = useCallback(async () => {
     setLoading(true)
@@ -123,7 +122,6 @@ export default function Feed({ user, company }) {
   const onSwipe = useCallback(async (direction, card) => {
     const dwellMs = swipeStartTime.current ? Date.now() - swipeStartTime.current : null
 
-    setLastSwipe({ direction, title: card.title })
     setSwipeCount(prev => prev + 1)
     setSwipeHistory(prev => [...prev.slice(-(SWIPE_HISTORY_MAX - 1)), { card, direction }])
     setCards(prev => prev.filter(c => c.id !== card.id))
@@ -154,7 +152,6 @@ export default function Feed({ user, company }) {
     const dwellMs = swipeStartTime.current ? Date.now() - swipeStartTime.current : null
 
     setSavingCardId(card.id)
-    setLastSwipe({ direction: 'right', title: card.title })
 
     setTimeout(() => {
       setSavingCardId(null)
@@ -193,7 +190,6 @@ export default function Feed({ user, company }) {
     setSwipeHistory(prev => prev.slice(0, -1))
     setCards(prev => [...prev, last.card])
     setSwipeCount(prev => Math.max(0, prev - 1))
-    setLastSwipe(null)
 
     db.deleteSwipe({ userId: user.id, opportunityId: last.card.id })
       .catch(err => console.error('Undo swipe delete failed:', err))
@@ -209,7 +205,7 @@ export default function Feed({ user, company }) {
     const card = cards[currentIndex]
     if (!card) return
     setCards(prev => prev.filter(c => c.id !== card.id))
-    setLastSwipe({ direction: 'bookmark', title: card.title })
+    setBookmarkCount(prev => prev + 1)
     db.addBookmark({
       companyId: company.id,
       opportunityId: card.id,
@@ -226,9 +222,12 @@ export default function Feed({ user, company }) {
     }).catch(() => {})
   }, [user.id, company.id])
 
-  // When user removes from Saved list, keep count in sync
   const handleRemoveFromSaved = useCallback(() => {
     setSavedCount(prev => Math.max(0, prev - 1))
+  }, [])
+
+  const handleRemoveFromBookmarks = useCallback(() => {
+    setBookmarkCount(prev => Math.max(0, prev - 1))
   }, [])
 
   // ── Empty/error states ────────────────────────────────────────────────────
@@ -240,7 +239,7 @@ export default function Feed({ user, company }) {
           <div style={styles.spinner} />
           <p style={{ color: 'var(--muted)', marginTop: '16px', fontSize: '14px' }}>Loading your feed...</p>
         </div>
-        <BottomNav view={view} setView={setView} savedCount={savedCount} />
+        <BottomNav view={view} setView={setView} savedCount={savedCount} bookmarkCount={bookmarkCount} />
       </div>
     )
   }
@@ -256,7 +255,7 @@ export default function Feed({ user, company }) {
           </p>
           <button style={styles.refreshBtn} onClick={loadFeed}>Retry</button>
         </div>
-        <BottomNav view={view} setView={setView} savedCount={savedCount} />
+        <BottomNav view={view} setView={setView} savedCount={savedCount} bookmarkCount={bookmarkCount} />
       </div>
     )
   }
@@ -270,7 +269,7 @@ export default function Feed({ user, company }) {
           <p style={{ color: 'var(--muted)', fontSize: '14px' }}>Check back tomorrow for new opportunities.</p>
           <button style={styles.refreshBtn} onClick={loadFeed}>Refresh feed</button>
         </div>
-        <BottomNav view={view} setView={setView} savedCount={savedCount} />
+        <BottomNav view={view} setView={setView} savedCount={savedCount} bookmarkCount={bookmarkCount} />
       </div>
     )
   }
@@ -280,8 +279,7 @@ export default function Feed({ user, company }) {
 
       {view === 'feed' ? (
         <>
-          {/* feedContent only holds header + deck — overflow:hidden clips card animations
-              but must NOT contain the action buttons or they get clipped too */}
+          {/* feedContent holds header + deck — pageShell's overflow:hidden clips swipe animations */}
           <div style={styles.feedContent}>
 
             {/* Header */}
@@ -290,25 +288,6 @@ export default function Feed({ user, company }) {
               <div style={styles.swipeCount}>{swipeCount} reviewed today</div>
             </div>
 
-            {/* Swipe feedback — absolutely positioned inside feedContent */}
-            {lastSwipe && (
-              <div style={{
-                ...styles.swipeFeedback,
-                background: lastSwipe.direction === 'right' ? '#22c55e22'
-                  : lastSwipe.direction === 'bookmark' ? '#6366f122'
-                  : '#ef444422',
-                color: lastSwipe.direction === 'right' ? '#22c55e'
-                  : lastSwipe.direction === 'bookmark' ? '#6366f1'
-                  : '#ef4444',
-                borderColor: lastSwipe.direction === 'right' ? '#22c55e44'
-                  : lastSwipe.direction === 'bookmark' ? '#6366f144'
-                  : '#ef444444',
-              }}>
-                {lastSwipe.direction === 'right' ? '✓ Saved'
-                  : lastSwipe.direction === 'bookmark' ? '🔖 Bookmarked'
-                  : '✕ Passed'}
-              </div>
-            )}
 
             {/* Card stack */}
             <div style={styles.deck}>
@@ -319,11 +298,19 @@ export default function Feed({ user, company }) {
                     key={card.id}
                     ref={el => cardRefs.current[index] = el}
                     onSwipe={(dir) => onSwipe(dir, card)}
+                    onSwipeRequirementFulfilled={(dir) => {
+                      if (index === currentIndex)
+                        cardHintRefs.current[index]?.setHint(dir)
+                    }}
+                    onSwipeRequirementUnfulfilled={() => {
+                      cardHintRefs.current[currentIndex]?.setHint(null)
+                    }}
                     preventSwipe={['up', 'down']}
                     swipeRequirementType="position"
                     swipeThreshold={80}
                   >
                     <OpportunityCard
+                      ref={el => cardHintRefs.current[index] = el}
                       card={card}
                       isTop={index === currentIndex}
                       preload={index >= currentIndex - 2}
@@ -364,14 +351,19 @@ export default function Feed({ user, company }) {
 
           <p style={styles.hint}>← swipe to pass &nbsp;·&nbsp; ↩ undo</p>
         </>
-      ) : (
+      ) : view === 'liked' ? (
         <SavedList
           company={company}
           onRemove={handleRemoveFromSaved}
         />
+      ) : (
+        <BookmarksList
+          company={company}
+          onRemove={handleRemoveFromBookmarks}
+        />
       )}
 
-      <BottomNav view={view} setView={setView} savedCount={savedCount} />
+      <BottomNav view={view} setView={setView} savedCount={savedCount} bookmarkCount={bookmarkCount} />
 
       {/* Detail modal */}
       {expandedCard && (
@@ -386,7 +378,7 @@ export default function Feed({ user, company }) {
   )
 }
 
-function BottomNav({ view, setView, savedCount }) {
+function BottomNav({ view, setView, savedCount, bookmarkCount }) {
   return (
     <div style={styles.bottomNav}>
       <button
@@ -396,10 +388,16 @@ function BottomNav({ view, setView, savedCount }) {
         Feed
       </button>
       <button
-        onClick={() => setView('saved')}
-        style={{ ...styles.navTab, ...(view === 'saved' ? styles.navTabActive : {}) }}
+        onClick={() => setView('liked')}
+        style={{ ...styles.navTab, ...(view === 'liked' ? styles.navTabActive : {}) }}
       >
-        Saved{savedCount > 0 ? ` (${savedCount})` : ''}
+        Liked{savedCount > 0 ? ` (${savedCount})` : ''}
+      </button>
+      <button
+        onClick={() => setView('bookmarks')}
+        style={{ ...styles.navTab, ...(view === 'bookmarks' ? styles.navTabActive : {}) }}
+      >
+        Bookmarks{bookmarkCount > 0 ? ` (${bookmarkCount})` : ''}
       </button>
     </div>
   )
@@ -439,12 +437,14 @@ const styles = {
   feedContent: {
     position: 'relative',
     flex: 1,
+    minHeight: 0,
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'center',
     padding: '20px 20px 0',
     gap: '16px',
-    overflow: 'hidden',
+    // No overflow:hidden here — pageShell clips swipe animations at viewport edge.
+    // overflow:hidden on feedContent was clipping the card footer/Details button.
   },
   header: {
     width: '100%',
@@ -458,14 +458,6 @@ const styles = {
     fontSize: '12px', color: 'var(--muted)',
     background: 'var(--surface)', padding: '4px 10px',
     borderRadius: '20px', border: '1px solid var(--border)',
-  },
-  swipeFeedback: {
-    position: 'absolute',
-    top: '80px',
-    zIndex: 200,
-    fontSize: '13px', fontWeight: '600',
-    padding: '6px 14px', borderRadius: '20px',
-    border: '1px solid', pointerEvents: 'none',
   },
   deck: {
     position: 'relative',

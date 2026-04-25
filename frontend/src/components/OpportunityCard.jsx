@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef, useImperativeHandle, forwardRef } from 'react'
 import { api } from '../lib/api'
 
 const URGENCY_COLORS = { red: '#ef4444', yellow: '#eab308', green: '#22c55e', normal: '#8888a0' }
@@ -31,8 +31,42 @@ const FLAG_COLORS = {
 }
 const FLAG_ICONS = { clearance: '🔒', cert: '📋', vehicle: '🔗', sole: '⚠️' }
 
-export default function OpportunityCard({ card, style, isTop, preload, onExpand, onSave }) {
+const OpportunityCard = forwardRef(function OpportunityCard(
+  { card, style, isTop, preload, onExpand, onSave },
+  ref
+) {
   const [aiScope, setAiScope] = useState(card.ai_summary)
+
+  // Refs to the two overlay DOM nodes — mutated directly, zero re-renders
+  const overlayRef = useRef(null)
+  const stampRef   = useRef(null)
+
+  // Expose setHint(dir) so Feed can drive feedback without touching React state
+  useImperativeHandle(ref, () => ({
+    setHint(dir) {
+      const overlay = overlayRef.current
+      const stamp   = stampRef.current
+      if (!overlay || !stamp) return
+
+      if (!dir) {
+        overlay.style.opacity = '0'
+        stamp.style.opacity   = '0'
+        return
+      }
+
+      const isRight = dir === 'right'
+      overlay.style.background = isRight ? 'rgba(34,197,94,0.13)' : 'rgba(239,68,68,0.13)'
+      overlay.style.opacity    = '1'
+
+      stamp.textContent        = isRight ? 'BID' : 'PASS'
+      stamp.style.color        = isRight ? '#22c55e' : '#ef4444'
+      stamp.style.borderColor  = isRight ? '#22c55e' : '#ef4444'
+      stamp.style.transform    = `scale(1.05) rotate(${isRight ? 12 : -12}deg)`
+      stamp.style.right        = isRight ? '20px' : 'auto'
+      stamp.style.left         = isRight ? 'auto' : '20px'
+      stamp.style.opacity      = '1'
+    },
+  }), [])
 
   // Pre-warm AI scope description for top 3 cards
   useEffect(() => {
@@ -94,6 +128,12 @@ export default function OpportunityCard({ card, style, isTop, preload, onExpand,
   return (
     <div style={{ ...styles.card, ...style }}>
 
+      {/* Swipe color wash — driven via ref, never triggers re-render */}
+      <div ref={overlayRef} style={styles.swipeOverlay} />
+
+      {/* BID / PASS stamp — driven via ref */}
+      <div ref={stampRef} style={styles.swipeStamp} />
+
       {/* Header: who is buying + value */}
       <div style={styles.agencyRow}>
         <div style={styles.agencyIcon}>
@@ -132,7 +172,7 @@ export default function OpportunityCard({ card, style, isTop, preload, onExpand,
           <DataRow label="Fit" value={fitParts.join(' · ')} />
         )}
         {scopeText && (
-          <DataRow label="Scope" value={scopeText} />
+          <DataRow label="Scope" value={scopeText} lines={3} />
         )}
         {buyerParts.length > 0 && (
           <DataRow label="Buyer" value={buyerParts.join(' · ')} />
@@ -190,13 +230,15 @@ export default function OpportunityCard({ card, style, isTop, preload, onExpand,
       )}
     </div>
   )
-}
+})
 
-function DataRow({ label, value, muted }) {
+export default OpportunityCard
+
+function DataRow({ label, value, muted, lines = 2 }) {
   return (
     <div style={styles.dataRow}>
       <span style={styles.dataLabel}>{label}</span>
-      <span style={{ ...styles.dataValue, color: muted ? 'var(--muted)' : 'var(--text)' }}>
+      <span style={{ ...styles.dataValue, WebkitLineClamp: lines, color: muted ? 'var(--muted)' : 'var(--text)' }}>
         {value}
       </span>
     </div>
@@ -311,4 +353,25 @@ const styles = {
   // Score bar
   scoreBar: { height: '2px', background: 'var(--border)', borderRadius: '1px', marginTop: '-4px' },
   scoreFill: { height: '100%', background: 'var(--primary)', borderRadius: '1px', opacity: 0.4 },
+
+  // Swipe feedback — always in DOM, shown/hidden via direct style mutation (no re-render)
+  swipeOverlay: {
+    position: 'absolute', inset: 0,
+    borderRadius: 'var(--radius)',
+    pointerEvents: 'none',
+    opacity: 0,
+    transition: 'opacity 150ms ease',
+    zIndex: 10,
+  },
+  swipeStamp: {
+    position: 'absolute', top: '22px',
+    pointerEvents: 'none',
+    fontSize: '22px', fontWeight: '800', letterSpacing: '0.08em',
+    border: '3px solid transparent',
+    borderRadius: '6px',
+    padding: '3px 10px',
+    opacity: 0,
+    transition: 'opacity 150ms ease, transform 150ms ease',
+    zIndex: 11,
+  },
 }

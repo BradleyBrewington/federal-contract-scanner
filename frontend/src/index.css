@@ -14,7 +14,8 @@
   --muted: #8888a0;
   --radius: 16px;
   --card-width: 360px;
-  --card-height: 520px;
+  /* Adapts to viewport: never taller than available space above the action row + nav */
+  --card-height: min(520px, calc(100svh - 280px));
 }
 
 html, body, #root {

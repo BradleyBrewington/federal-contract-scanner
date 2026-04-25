@@ -15,6 +15,8 @@ goes React → Supabase directly, so this API stays small.
 import os
 import re
 import json
+import math
+import time
 import random
 import base64
 import logging
@@ -56,6 +58,23 @@ ACTIONABLE_NOTICE_TYPES = [
     "solicitation", "presolicitation", "combined",
     "sources_sought", "special",
 ]
+
+# ---------------------------------------------------------------------------
+# Behavioral scorer constants
+# ---------------------------------------------------------------------------
+
+_SIGNAL_CACHE_TTL   = 1800    # seconds — recompute swipe signals every 30 min
+_HALF_LIFE_DAYS     = 45.0    # calendar time decay half-life
+_HALF_LIFE_SWIPES   = 150.0   # positional decay half-life (swipes ago)
+_MIN_BEHAVIORAL_SW  = 20      # swipes before behavioral signal activates
+_BLEND_RAMP_SWIPES  = 250.0   # swipes at which blend reaches max weight
+_MAX_BLEND          = 0.80    # maximum behavioral weight (rule-based never drops below 20%)
+_PRIOR_N            = 10.0    # effective sample size for Beta prior (controls how fast data overrides prior)
+_MIN_NAICS_OBS      = 5.0     # minimum weighted swipes to trust a NAICS-level estimate
+
+# In-memory cache: company_id → {"ts": float, "signals": dict}
+_signals_cache: dict = {}
+_signals_lock = threading.Lock()
 
 # Static lookup tables — human-readable labels for codes shown on cards.
 NAICS_TITLES = {
@@ -608,32 +627,331 @@ def require_auth(f):
 # Scoring
 # ---------------------------------------------------------------------------
 
-def score_opportunity(opp: dict, profile: dict) -> int:
+# ── Swipe signal helpers ────────────────────────────────────────────────────
+
+def _dwell_weight(dwell_ms, direction: str, expanded: bool) -> float:
     """
-    Score an opportunity against a company profile. Returns 0–100.
-    Phase 1: pure rule-based weighted scoring. No ML yet.
+    Weight a single swipe by signal quality.
+    High dwell + deliberate action = stronger signal.
+    Fast reflexive swipes carry less weight.
+    """
+    dwell_s = (dwell_ms / 1000.0) if dwell_ms else 3.0  # assume 3s if missing
+
+    if direction == "right":
+        if expanded:    return 2.0   # opened detail view then saved — strongest signal
+        if dwell_s >= 5: return 1.5  # looked carefully, then saved
+        return 0.5                    # fast save — moderate signal
+    else:  # left
+        if dwell_s < 2:  return 0.2  # reflexive pass — very weak negative
+        if dwell_s >= 10: return 1.5 # read it carefully, still passed — strong negative
+        return 1.0                    # considered and rejected — standard negative
+
+
+def _time_decay(created_at_str, swipes_ago: int) -> float:
+    """
+    Exponential decay by calendar time AND swipe position.
+    Uses whichever clock decays faster — handles both active and dormant users.
+    """
+    try:
+        ts = datetime.fromisoformat((created_at_str or "").replace("Z", "+00:00"))
+        days_ago = max(0.0, (datetime.now(timezone.utc) - ts).total_seconds() / 86400.0)
+    except (ValueError, AttributeError):
+        days_ago = 30.0  # conservative fallback
+
+    time_decay  = math.exp(-math.log(2) * days_ago  / _HALF_LIFE_DAYS)
+    swipe_decay = math.exp(-math.log(2) * swipes_ago / _HALF_LIFE_SWIPES)
+    return min(time_decay, swipe_decay)
+
+
+def _beta_sample(alpha: float, beta: float) -> float:
+    """
+    Sample from Beta(alpha, beta) using stdlib only (no numpy).
+    Uses the Gamma representation: X~Gamma(α,1), Y~Gamma(β,1) → X/(X+Y)~Beta(α,β).
+    """
+    x = random.gammavariate(max(alpha, 1e-6), 1.0)
+    y = random.gammavariate(max(beta,  1e-6), 1.0)
+    total = x + y
+    return x / total if total > 0 else 0.5
+
+
+def _naics_weighted_obs(naics_code: str, rights: dict, lefts: dict):
+    """
+    Return (weighted_rights, weighted_lefts) for a NAICS code using
+    hierarchical fallback: 6-digit → 4-digit group → 2-digit sector → (0, 0).
+    Falls back to the next level only if the finer level has < _MIN_NAICS_OBS
+    weighted swipes, preventing a single lucky like from dominating.
+    """
+    for prefix_len in (6, 4, 2):
+        pfx = naics_code[:prefix_len]
+        wr = sum(v for k, v in rights.items() if k[:prefix_len] == pfx)
+        wl = sum(v for k, v in lefts.items() if k[:prefix_len] == pfx)
+        if wr + wl >= _MIN_NAICS_OBS:
+            return wr, wl
+    return 0.0, 0.0  # unseen — prior will dominate
+
+
+def compute_swipe_signals(sb, company_id: str) -> dict:
+    """
+    Compute per-company behavioral signals from swipe history.
+    Returns a signals dict cached in-memory for _SIGNAL_CACHE_TTL seconds.
+
+    Signals dict keys:
+      total_swipes    — raw count
+      global_rate     — weighted right-swipe rate (used as Bayesian prior mean)
+      naics_rights    — {naics_code: weighted_rights}
+      naics_lefts     — {naics_code: weighted_lefts}
+      agency_rights   — {agency_lower: weighted_rights}
+      agency_lefts    — {agency_lower: weighted_lefts}
+      value_centroid  — geometric mean of liked opportunity values (dollars)
+      value_log_std   — std dev of log(value) across liked opportunities
+    """
+    now = time.time()
+    with _signals_lock:
+        cached = _signals_cache.get(company_id)
+        if cached and now - cached["ts"] < _SIGNAL_CACHE_TTL:
+            return cached["signals"]
+
+    # Fetch most recent 2000 swipes with opportunity data joined.
+    # Ordered ASC so index == chronological position for decay calculation.
+    result = sb.table("swipes").select(
+        "opportunity_id, direction, dwell_ms, expanded, created_at, "
+        "opportunities(naics_code, agency, value_max)"
+    ).eq("company_id", company_id).in_(
+        "direction", ["left", "right"]
+    ).order("created_at", desc=False).limit(2000).execute()
+
+    swipes = result.data or []
+    total = len(swipes)
+
+    _empty = {"total_swipes": 0, "global_rate": 0.08}  # 8% prior when no data
+    if total == 0:
+        with _signals_lock:
+            _signals_cache[company_id] = {"ts": now, "signals": _empty}
+        return _empty
+
+    total_w_rights = 0.0
+    total_w_lefts  = 0.0
+    naics_rights: dict = {}
+    naics_lefts:  dict = {}
+    agency_rights: dict = {}
+    agency_lefts:  dict = {}
+    liked_log_vals: list = []   # (log_value, weight) for right-swipes with a value
+
+    for i, swipe in enumerate(swipes):
+        direction  = swipe.get("direction") or ""
+        dwell_ms   = swipe.get("dwell_ms")
+        expanded   = bool(swipe.get("expanded"))
+        created_at = swipe.get("created_at")
+        opp        = swipe.get("opportunities") or {}
+
+        dw = _dwell_weight(dwell_ms, direction, expanded)
+        td = _time_decay(created_at, swipes_ago=total - 1 - i)
+        w  = dw * td
+
+        is_right = direction == "right"
+        if is_right:
+            total_w_rights += w
+        else:
+            total_w_lefts += w
+
+        naics = (opp.get("naics_code") or "").strip()
+        if naics:
+            bucket = naics_rights if is_right else naics_lefts
+            bucket[naics] = bucket.get(naics, 0.0) + w
+
+        agency = (opp.get("agency") or "").lower().strip()
+        if agency:
+            bucket = agency_rights if is_right else agency_lefts
+            bucket[agency] = bucket.get(agency, 0.0) + w
+
+        if is_right:
+            try:
+                v = float(opp.get("value_max") or 0)
+                if v > 0:
+                    liked_log_vals.append((math.log(v), w))
+            except (ValueError, TypeError):
+                pass
+
+    total_w = total_w_rights + total_w_lefts
+    global_rate = total_w_rights / total_w if total_w > 0 else 0.08
+
+    # Weighted mean and std dev of log(value) across liked opportunities
+    value_centroid = None
+    value_log_std  = 1.2   # default ~3.3× spread if no liked values
+    if liked_log_vals:
+        w_total  = sum(w for _, w in liked_log_vals)
+        mean_log = sum(lv * w for lv, w in liked_log_vals) / w_total
+        var_log  = sum(w * (lv - mean_log) ** 2 for lv, w in liked_log_vals) / w_total
+        value_centroid = math.exp(mean_log)
+        value_log_std  = max(math.sqrt(var_log), 0.5)  # floor at 0.5 log units
+
+    signals = {
+        "total_swipes":   total,
+        "global_rate":    global_rate,
+        "naics_rights":   naics_rights,
+        "naics_lefts":    naics_lefts,
+        "agency_rights":  agency_rights,
+        "agency_lefts":   agency_lefts,
+        "value_centroid": value_centroid,
+        "value_log_std":  value_log_std,
+    }
+
+    with _signals_lock:
+        _signals_cache[company_id] = {"ts": now, "signals": signals}
+
+    logger.info(
+        f"Swipe signals [{company_id[:8]}]: {total} swipes, "
+        f"global_rate={global_rate:.3f}, naics_tracked={len(naics_rights)}"
+    )
+    return signals
+
+
+# ── Behavioral component scorers ────────────────────────────────────────────
+
+def _naics_affinity(naics_code: str, signals: dict) -> float:
+    """
+    Thompson-sampled, lift-normalized NAICS affinity in [0, 1].
+
+    Unseen NAICS (zero weighted observations at all hierarchy levels) returns
+    exactly 0.5 — neutral, no penalty. Thompson sampling only applies once we
+    have real observations; sampling from the bare prior on a Beta(0.8, 9.2)
+    produces heavily skewed draws near 0, not the intended neutral signal.
+
+    Liked NAICS returns > 0.5; disliked NAICS returns < 0.5.
+    """
+    wr, wl = _naics_weighted_obs(naics_code, signals["naics_rights"], signals["naics_lefts"])
+    if wr + wl == 0:
+        return 0.5   # no data → neutral
+
+    gr = signals["global_rate"]
+    a0 = gr * _PRIOR_N
+    b0 = (1.0 - gr) * _PRIOR_N
+
+    sample   = _beta_sample(a0 + wr, b0 + wl)
+    raw_lift = sample / max(gr, 0.001)
+    return raw_lift / (raw_lift + 1.0)   # monotonic compression into [0, 1]
+
+
+def _agency_affinity(agency: str, signals: dict) -> float:
+    """
+    Thompson-sampled, lift-normalized agency affinity in [0, 1].
+    Unseen agencies return 0.5 (neutral). No hierarchical fallback for agencies.
+    """
+    agency_lower = agency.lower().strip()
+    wr = signals["agency_rights"].get(agency_lower, 0.0)
+    wl = signals["agency_lefts"].get(agency_lower, 0.0)
+    if wr + wl == 0:
+        return 0.5   # no data → neutral
+
+    gr = signals["global_rate"]
+    a0 = gr * _PRIOR_N
+    b0 = (1.0 - gr) * _PRIOR_N
+
+    sample   = _beta_sample(a0 + wr, b0 + wl)
+    raw_lift = sample / max(gr, 0.001)
+    return raw_lift / (raw_lift + 1.0)
+
+
+def _value_alignment(opp_value, signals: dict) -> float:
+    """
+    Log-Gaussian proximity to the liked value centroid, in [0, 1].
+    Returns 0.5 (neutral) when no centroid data exists.
+    """
+    centroid = signals.get("value_centroid")
+    if not centroid or not opp_value:
+        return 0.5
+    try:
+        v = float(opp_value)
+        if v <= 0:
+            return 0.5
+    except (ValueError, TypeError):
+        return 0.5
+
+    sigma = signals.get("value_log_std", 1.2)
+    diff  = (math.log(v) - math.log(centroid)) / sigma
+    return math.exp(-0.5 * diff * diff)
+
+
+def _behavioral_score(opp: dict, signals: dict) -> float:
+    """
+    Behavioral score 0–100 from four components:
+      40% NAICS affinity   — primary structural signal
+      25% agency affinity  — relationship / domain signal
+      20% value alignment  — contract size fit
+      15% keyword lift     — placeholder, neutral until Stage 3
+
+    Each component is in [0, 1]; 0.5 = neutral (unseen), >0.5 = positive signal.
+    """
+    naics_code = (opp.get("naics_code") or "").strip()
+    agency     = (opp.get("agency")     or "").strip()
+    opp_value  = opp.get("value_max") or opp.get("value_min")
+
+    naics_comp   = _naics_affinity(naics_code, signals) if naics_code else 0.5
+    agency_comp  = _agency_affinity(agency,     signals) if agency     else 0.5
+    value_comp   = _value_alignment(opp_value,  signals)
+    keyword_comp = 0.5   # neutral until Stage 3 (keyword lift from liked corpus)
+
+    weighted = (
+        0.40 * naics_comp  +
+        0.25 * agency_comp +
+        0.20 * value_comp  +
+        0.15 * keyword_comp
+    )
+    return weighted * 100.0
+
+
+# ── Rule-based scorer (static profile matching) ─────────────────────────────
+
+def _is_hard_excluded(opp: dict, profile: dict) -> bool:
+    """True if the opportunity should be zeroed out regardless of behavioral signals."""
+    excluded_agencies = {
+        a["agency_name"].lower()
+        for a in profile.get("agencies", [])
+        if a.get("relationship_type") == "exclude"
+    }
+    exclusion_keywords = [
+        k["keyword"].lower()
+        for k in profile.get("keywords", [])
+        if k.get("is_exclusion")
+    ]
+
+    agency_lower = (opp.get("agency") or "").lower()
+    if any(excl in agency_lower for excl in excluded_agencies):
+        return True
+
+    text = (opp.get("title") or "").lower() + " " + (opp.get("description") or "").lower()
+    return any(kw in text for kw in exclusion_keywords)
+
+
+def _is_expired(opp: dict) -> bool:
+    """True if the opportunity deadline has passed."""
+    deadline_str = opp.get("response_deadline")
+    if not deadline_str:
+        return False
+    try:
+        deadline = datetime.fromisoformat(deadline_str.replace("Z", "+00:00"))
+        return (deadline - datetime.now(timezone.utc)).days < 0
+    except ValueError:
+        return False
+
+
+def _rule_based_score(opp: dict, profile: dict) -> int:
+    """
+    Static rule-based score 0–100 against company profile.
+    Does not check hard exclusions or expiry — those are handled by score_opportunity.
     """
     score = 0
 
     naics_codes = {n["naics_code"] for n in profile.get("naics", [])}
-    keywords = [k["keyword"].lower() for k in profile.get("keywords", []) if not k.get("is_exclusion")]
-    exclusion_keywords = [k["keyword"].lower() for k in profile.get("keywords", []) if k.get("is_exclusion")]
-    target_agencies = {a["agency_name"].lower() for a in profile.get("agencies", []) if a.get("relationship_type") in ("past_performance", "target")}
-    excluded_agencies = {a["agency_name"].lower() for a in profile.get("agencies", []) if a.get("relationship_type") == "exclude"}
+    keywords    = [k["keyword"].lower() for k in profile.get("keywords", []) if not k.get("is_exclusion")]
+    target_agencies = {
+        a["agency_name"].lower()
+        for a in profile.get("agencies", [])
+        if a.get("relationship_type") in ("past_performance", "target")
+    }
     contract_min = profile.get("contract_min") or 0
     contract_max = profile.get("contract_max") or float("inf")
     set_aside_eligibility = set(profile.get("set_aside_eligibility") or [])
-
-    # Hard exclusions — return 0 immediately
-    agency_lower = (opp.get("agency") or "").lower()
-    if any(excl in agency_lower for excl in excluded_agencies):
-        return 0
-
-    desc_lower = (opp.get("description") or "").lower()
-    title_lower = (opp.get("title") or "").lower()
-    text = f"{title_lower} {desc_lower}"
-    if any(kw in text for kw in exclusion_keywords):
-        return 0
 
     # NAICS match — worth 35 points
     opp_naics = opp.get("naics_code") or ""
@@ -645,17 +963,11 @@ def score_opportunity(opp: dict, profile: dict) -> int:
     # Set-aside alignment — worth 20 points
     opp_set_aside = (opp.get("set_aside_type") or "").upper()
     set_aside_map = {
-        "SBA": "small_business",
-        "8AN": "8a",
-        "8A": "8a",
-        "SDVOSBC": "sdvosb",
-        "SDVOSBR": "sdvosb",
-        "WOSB": "wosb",
-        "EDWOSB": "wosb",
-        "HZC": "hubzone",
-        "HZS": "hubzone",
-        "": "none",
-        "NONE": "none",
+        "SBA": "small_business", "8AN": "8a", "8A": "8a",
+        "SDVOSBC": "sdvosb",     "SDVOSBR": "sdvosb",
+        "WOSB": "wosb",          "EDWOSB": "wosb",
+        "HZC": "hubzone",        "HZS": "hubzone",
+        "": "none",              "NONE": "none",
     }
     normalized_set_aside = set_aside_map.get(opp_set_aside, "")
     if not opp_set_aside or normalized_set_aside == "none":
@@ -666,38 +978,65 @@ def score_opportunity(opp: dict, profile: dict) -> int:
     # Contract value in range — worth 15 points
     opp_value = opp.get("value_max") or opp.get("value_min")
     if opp_value:
-        if contract_min <= float(opp_value) <= contract_max:
-            score += 15
-        elif float(opp_value) < contract_min * 0.5 or float(opp_value) > contract_max * 2:
-            score -= 10  # Way outside range
+        try:
+            v = float(opp_value)
+            if contract_min <= v <= contract_max:
+                score += 15
+            elif v < contract_min * 0.5 or v > contract_max * 2:
+                score -= 10
+        except (ValueError, TypeError):
+            pass
 
     # Agency affinity — worth 15 points
+    agency_lower = (opp.get("agency") or "").lower()
     if any(ta in agency_lower for ta in target_agencies):
         score += 15
 
     # Keyword overlap — worth up to 15 points
     if keywords:
+        text = (opp.get("title") or "").lower() + " " + (opp.get("description") or "").lower()
         matches = sum(1 for kw in keywords if kw in text)
-        keyword_score = min(15, int((matches / max(len(keywords), 1)) * 15 * 3))
-        score += keyword_score
+        score += min(15, int((matches / max(len(keywords), 1)) * 45))
 
     # Deadline urgency adjustment
     deadline_str = opp.get("response_deadline")
     if deadline_str:
         try:
-            deadline = datetime.fromisoformat(deadline_str.replace("Z", "+00:00"))
-            now = datetime.now(timezone.utc)
-            days_left = (deadline - now).days
-            if days_left < 0:
-                return 0  # Expired
-            elif days_left <= 7:
-                score += 5   # Closing soon — boost visibility
-            elif days_left <= 21:
-                score += 2
+            deadline  = datetime.fromisoformat(deadline_str.replace("Z", "+00:00"))
+            days_left = (deadline - datetime.now(timezone.utc)).days
+            if   days_left <= 7:  score += 5
+            elif days_left <= 21: score += 2
         except ValueError:
             pass
 
     return max(0, min(100, score))
+
+
+def score_opportunity(opp: dict, profile: dict, signals: dict | None = None) -> int:
+    """
+    Final opportunity score 0–100.
+
+    Hard exclusions (excluded agencies, exclusion keywords, expired deadlines)
+    always return 0 regardless of behavioral signals.
+
+    Otherwise: blends rule-based score with behavioral score.
+    Blend weight ramps from 0% at 20 swipes to 80% at 250+ swipes,
+    so new accounts get pure rule-based scoring until enough data accumulates.
+    """
+    if _is_hard_excluded(opp, profile):
+        return 0
+    if _is_expired(opp):
+        return 0
+
+    rule_score = _rule_based_score(opp, profile)
+
+    if not signals or signals["total_swipes"] < _MIN_BEHAVIORAL_SW:
+        return rule_score
+
+    behavioral = _behavioral_score(opp, signals)
+    blend = min(_MAX_BLEND, signals["total_swipes"] / _BLEND_RAMP_SWIPES)
+    combined = rule_score * (1.0 - blend) + behavioral * blend
+    return max(0, min(100, int(combined)))
 
 
 def build_company_profile(sb, company_id: str) -> dict:
@@ -746,38 +1085,61 @@ def get_feed():
     swiped = sb.table("swipes").select("opportunity_id").eq("user_id", user_id).execute()
     swiped_ids = [s["opportunity_id"] for s in (swiped.data or [])]
 
-    # Fetch candidate opportunities from Supabase
-    # Pre-filter: active status, not already swiped
-    # Note: don't filter by deadline here — many valid records (awards, pre-sols,
-    # sources sought) have null deadlines. Scoring handles expired ones (returns 0).
-    now_iso = datetime.now(timezone.utc).isoformat()
-    query = (
-        sb.table("opportunities")
-        .select("id,notice_id,title,agency,sub_agency,naics_code,psc_code,set_aside_type,notice_type,value_min,value_max,pop_city,pop_state,response_deadline,posted_date,ai_summary,description,status,source,attachments")
-        .eq("status", "active")
-        .in_("notice_type", ACTIONABLE_NOTICE_TYPES)
-        .order("posted_date", desc=True)
-        .limit(500)  # Candidate pool for scoring
+    # Build company profile upfront — needed for NAICS pre-filter and scoring.
+    profile = build_company_profile(sb, company_id)
+    naics_codes = [n["naics_code"] for n in profile.get("naics", [])]
+
+    _SELECT = (
+        "id,notice_id,title,agency,sub_agency,naics_code,psc_code,set_aside_type,"
+        "notice_type,value_min,value_max,pop_city,pop_state,response_deadline,"
+        "posted_date,ai_summary,description,status,source,attachments"
     )
 
-    # Exclude already-swiped opportunities
-    if swiped_ids:
-        query = query.not_.in_("id", swiped_ids)
+    def _base_q():
+        """Base query with status + notice_type filters and swiped exclusion applied."""
+        q = (
+            sb.table("opportunities")
+            .select(_SELECT)
+            .eq("status", "active")
+            .in_("notice_type", ACTIONABLE_NOTICE_TYPES)
+        )
+        if swiped_ids:
+            q = q.not_.in_("id", swiped_ids)
+        return q
 
-    result = query.execute()
-    candidates = result.data or []
+    # Pass A — NAICS-matched candidates.
+    # Fetches ALL unswiped active opportunities in the company's NAICS codes,
+    # regardless of posted date. These are the highest-priority candidates and
+    # were previously invisible when the 500-record date-ordered pool cut them off.
+    naics_candidates: list = []
+    if naics_codes:
+        naics_candidates = _base_q().in_("naics_code", naics_codes).execute().data or []
+
+    naics_ids = {o["id"] for o in naics_candidates}
+
+    # Pass B — Recent diverse pool.
+    # Ordered by posted_date to surface new opportunities; deduped against Pass A.
+    # Capped at 1500 to bound Supabase round-trip latency.
+    recent_raw    = _base_q().order("posted_date", desc=True).limit(1500).execute().data or []
+    recent_unique = [o for o in recent_raw if o["id"] not in naics_ids]
+
+    # Combined pool: all NAICS matches + up to 1500 recent unique
+    candidates = naics_candidates + recent_unique
 
     if not candidates:
         return jsonify({"cards": [], "total": 0, "exhausted": True})
 
     if mode == "recent":
-        # Just return newest, no scoring
         cards = [format_card(o) for o in candidates[:limit]]
         return jsonify({"cards": cards, "total": len(candidates)})
 
-    # Score all candidates against company profile
-    profile = build_company_profile(sb, company_id)
-    scored = [(score_opportunity(o, profile), o) for o in candidates]
+    # Compute behavioral signals from swipe history (cached 30 min).
+    # Returns empty signals dict if company has < _MIN_BEHAVIORAL_SW swipes;
+    # score_opportunity falls back to pure rule-based in that case.
+    signals = compute_swipe_signals(sb, company_id)
+
+    # Score all candidates
+    scored = [(score_opportunity(o, profile, signals), o) for o in candidates]
     scored.sort(key=lambda x: x[0], reverse=True)
 
     # Mix: 70% top scorers, 20% exploration, 10% urgency

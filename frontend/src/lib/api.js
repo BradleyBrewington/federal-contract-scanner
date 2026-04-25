@@ -125,6 +125,22 @@ export const db = {
       .order('created_at', { ascending: false })
   },
 
+  // Get bookmarks for company
+  getBookmarks: async (companyId) => {
+    return supabase.from('bookmarks')
+      .select('*, opportunities(id,notice_id,title,agency,sub_agency,naics_code,set_aside_type,response_deadline,value_max,ai_summary)')
+      .eq('company_id', companyId)
+      .order('created_at', { ascending: false })
+  },
+
+  // Remove a bookmark
+  removeBookmark: async ({ companyId, opportunityId }) => {
+    return supabase.from('bookmarks')
+      .delete()
+      .eq('company_id', companyId)
+      .eq('opportunity_id', opportunityId)
+  },
+
   // Save company profile
   saveCompany: async (companyId, data) => {
     return supabase.from('companies').update(data).eq('id', companyId)
