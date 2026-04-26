@@ -15,9 +15,21 @@ const SET_ASIDE_LABELS = {
   HZC: 'HUBZone', HZS: 'HUBZone',
 }
 
+function unwrapDescription(text) {
+  if (!text) return text
+  if (text.trimStart().startsWith('{')) {
+    try {
+      const obj = JSON.parse(text)
+      return obj.description || obj.text || obj.content || null
+    } catch {}
+  }
+  return text
+}
+
 export default function DetailModal({ card, onClose, onPass, onSave }) {
   const scope = card.parsed_scope || {}
   const hasScope = scope.qty_display || scope.delivery_display || scope.nsn || scope.approved_source
+  const descriptionText = unwrapDescription(card.description_text)
   const noticeLabel = NOTICE_LABELS[card.notice_type] || card.notice_type || 'Opportunity'
   const setAsideLabel = card.set_aside_type && card.set_aside_type !== 'NONE'
     ? (SET_ASIDE_LABELS[card.set_aside_type] || card.set_aside_type)
@@ -73,16 +85,16 @@ export default function DetailModal({ card, onClose, onPass, onSave }) {
           )}
 
           {/* Raw description text — when available as text (not a URL) */}
-          {card.description_text && (
+          {descriptionText && (
             <Section label="Description">
-              {card.description_text.split('\n\n').map((para, i) => (
+              {descriptionText.split('\n\n').map((para, i) => (
                 <p key={i} style={styles.descText}>{para}</p>
               ))}
             </Section>
           )}
 
           {/* No description available */}
-          {!card.description_text && !hasScope && (
+          {!descriptionText && !hasScope && (
             <div style={styles.noDesc}>
               <p style={styles.noDescText}>
                 Full description available on SAM.gov.
@@ -212,7 +224,7 @@ const styles = {
   sheet: {
     background: 'var(--surface)',
     borderRadius: '20px 20px 0 0',
-    width: '100%', maxWidth: '520px', maxHeight: '90vh',
+    width: '100%', maxWidth: '520px', maxHeight: '82svh',
     display: 'flex', flexDirection: 'column', overflow: 'hidden',
   },
   handle: {
@@ -234,9 +246,9 @@ const styles = {
   subAgency: { fontSize: '11px', color: 'var(--muted)', marginTop: '1px' },
   closeBtn: {
     background: 'var(--surface2)', border: '1px solid var(--border)',
-    borderRadius: '50%', width: '28px', height: '28px',
+    borderRadius: '50%', width: '44px', height: '44px',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
-    fontSize: '12px', color: 'var(--muted)', cursor: 'pointer', flexShrink: 0,
+    fontSize: '14px', color: 'var(--muted)', cursor: 'pointer', flexShrink: 0,
   },
   title: { fontSize: '16px', fontWeight: '700', color: 'var(--text)', lineHeight: '1.4' },
 
