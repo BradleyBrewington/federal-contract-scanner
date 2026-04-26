@@ -32,7 +32,7 @@ const FLAG_COLORS = {
 const FLAG_ICONS = { clearance: '🔒', cert: '📋', vehicle: '🔗', sole: '⚠️' }
 
 const OpportunityCard = forwardRef(function OpportunityCard(
-  { card, style, isTop, preload, onExpand, onSave },
+  { card, style, isTop, preload, onSave },
   ref
 ) {
   const [aiScope, setAiScope] = useState(card.ai_summary)
@@ -195,7 +195,7 @@ const OpportunityCard = forwardRef(function OpportunityCard(
         </button>
       )}
 
-      {/* Footer: deadline + details link */}
+      {/* Footer: deadline only — Details/SAM.gov rendered outside TinderCard in Feed */}
       <div style={styles.footer}>
         <div style={styles.deadlineRow}>
           <div style={{ ...styles.deadlineDot, background: urgencyColor }} />
@@ -203,29 +203,6 @@ const OpportunityCard = forwardRef(function OpportunityCard(
             {deadlineText}
             {card.days_left_derived && ' *'}
           </span>
-        </div>
-        <div style={styles.footerActions}>
-          {onExpand && (
-            <button
-              onClick={e => { e.stopPropagation(); onExpand() }}
-              onTouchStart={e => e.stopPropagation()}
-              onTouchEnd={e => e.stopPropagation()}
-              style={styles.detailsBtn}
-            >
-              Details
-            </button>
-          )}
-          <a
-            href={card.sam_url}
-            target="_blank"
-            rel="noreferrer"
-            style={styles.samLink}
-            onClick={e => e.stopPropagation()}
-            onTouchStart={e => e.stopPropagation()}
-            onTouchEnd={e => e.stopPropagation()}
-          >
-            SAM.gov ↗
-          </a>
         </div>
       </div>
 
@@ -345,18 +322,11 @@ const styles = {
 
   // Footer
   footer: {
-    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    display: 'flex', alignItems: 'center',
   },
   deadlineRow: { display: 'flex', alignItems: 'center', gap: '6px' },
   deadlineDot: { width: '7px', height: '7px', borderRadius: '50%', flexShrink: 0 },
   deadlineText: { fontSize: '12px', fontWeight: '600' },
-  footerActions: { display: 'flex', gap: '10px', alignItems: 'center' },
-  detailsBtn: {
-    fontSize: '11px', color: 'var(--primary)', background: 'none',
-    border: 'none', padding: '8px 10px', margin: '-8px -4px',
-    cursor: 'pointer', fontWeight: '600',
-  },
-  samLink: { fontSize: '11px', color: 'var(--muted)', padding: '8px 4px', margin: '-8px -4px' },
 
   // Score bar
   scoreBar: { height: '2px', background: 'var(--border)', borderRadius: '1px', marginTop: '-4px' },

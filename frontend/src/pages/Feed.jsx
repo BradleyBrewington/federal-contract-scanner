@@ -328,7 +328,6 @@ export default function Feed({ user, company }) {
                       card={card}
                       isTop={index === currentIndex}
                       preload={index >= currentIndex - 2}
-                      onExpand={() => handleExpand(card)}
                       onSave={() => handleSave(card)}
                       style={{
                         transform: isSaving
@@ -351,6 +350,24 @@ export default function Feed({ user, company }) {
               })}
             </div>
           </div>
+
+          {/* Details + SAM.gov — outside TinderCard so touch events are not intercepted by swipe handler */}
+          {cards[currentIndex] && (
+            <div style={styles.cardActions}>
+              <button onClick={() => handleExpand(cards[currentIndex])} style={styles.cardActionBtn}>
+                Details
+              </button>
+              <span style={styles.cardActionDivider}>·</span>
+              <a
+                href={cards[currentIndex].sam_url}
+                target="_blank"
+                rel="noreferrer"
+                style={styles.cardActionLink}
+              >
+                SAM.gov ↗
+              </a>
+            </div>
+          )}
 
           {/* Actions live OUTSIDE feedContent so overflow:hidden never clips them */}
           <div style={styles.actions}>
@@ -478,6 +495,32 @@ const styles = {
     width: 'var(--card-width)',
     height: 'var(--card-height)',
     flexShrink: 0,
+  },
+  cardActions: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '4px',
+  },
+  cardActionBtn: {
+    background: 'none',
+    border: 'none',
+    color: 'var(--primary)',
+    fontSize: '13px',
+    fontWeight: '600',
+    padding: '10px 16px',
+    cursor: 'pointer',
+  },
+  cardActionDivider: {
+    color: 'var(--border)',
+    fontSize: '13px',
+    userSelect: 'none',
+  },
+  cardActionLink: {
+    color: 'var(--muted)',
+    fontSize: '13px',
+    fontWeight: '500',
+    padding: '10px 16px',
   },
   actions: {
     display: 'flex',
