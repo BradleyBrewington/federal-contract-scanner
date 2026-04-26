@@ -206,7 +206,12 @@ const OpportunityCard = forwardRef(function OpportunityCard(
         </div>
         <div style={styles.footerActions}>
           {onExpand && (
-            <button onClick={e => { e.stopPropagation(); onExpand() }} style={styles.detailsBtn}>
+            <button
+              onClick={e => { e.stopPropagation(); onExpand() }}
+              onTouchStart={e => e.stopPropagation()}
+              onTouchEnd={e => e.stopPropagation()}
+              style={styles.detailsBtn}
+            >
               Details
             </button>
           )}
@@ -216,6 +221,8 @@ const OpportunityCard = forwardRef(function OpportunityCard(
             rel="noreferrer"
             style={styles.samLink}
             onClick={e => e.stopPropagation()}
+            onTouchStart={e => e.stopPropagation()}
+            onTouchEnd={e => e.stopPropagation()}
           >
             SAM.gov ↗
           </a>
@@ -346,9 +353,10 @@ const styles = {
   footerActions: { display: 'flex', gap: '10px', alignItems: 'center' },
   detailsBtn: {
     fontSize: '11px', color: 'var(--primary)', background: 'none',
-    border: 'none', padding: 0, cursor: 'pointer', fontWeight: '600',
+    border: 'none', padding: '8px 10px', margin: '-8px -4px',
+    cursor: 'pointer', fontWeight: '600',
   },
-  samLink: { fontSize: '11px', color: 'var(--muted)' },
+  samLink: { fontSize: '11px', color: 'var(--muted)', padding: '8px 4px', margin: '-8px -4px' },
 
   // Score bar
   scoreBar: { height: '2px', background: 'var(--border)', borderRadius: '1px', marginTop: '-4px' },

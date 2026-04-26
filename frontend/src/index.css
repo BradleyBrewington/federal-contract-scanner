@@ -13,7 +13,7 @@
   --text: #f1f1f3;
   --muted: #8888a0;
   --radius: 16px;
-  --card-width: 360px;
+  --card-width: min(360px, calc(100vw - 32px));
   /* Adapts to viewport: never taller than available space above the action row + nav */
   --card-height: min(520px, calc(100svh - 280px));
 }
@@ -54,3 +54,7 @@ input::placeholder, textarea::placeholder {
 }
 
 a { color: var(--primary); text-decoration: none; }
+
+@media (pointer: coarse) {
+  .feed-hint { display: none; }
+}

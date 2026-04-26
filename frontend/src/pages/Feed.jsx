@@ -363,7 +363,7 @@ export default function Feed({ user, company }) {
             <ActionBtn onClick={handleBookmark} color="#6366f1" label="Bookmark">🔖</ActionBtn>
           </div>
 
-          <p style={styles.hint}>← / J pass &nbsp;·&nbsp; → / L save &nbsp;·&nbsp; Z undo</p>
+          <p style={styles.hint} className="feed-hint">← / J pass &nbsp;·&nbsp; → / L save &nbsp;·&nbsp; Z undo</p>
         </>
       ) : view === 'liked' ? (
         <SavedList
