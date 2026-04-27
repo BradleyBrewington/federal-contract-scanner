@@ -200,6 +200,41 @@ create table pipeline (
 
 
 -- =============================================================================
+-- SCORER EVALS
+-- One row per evaluation run. Used to track whether feed quality is improving.
+-- Written by evaluate_scorer() in v2.py, read by the /api/v2/eval endpoint.
+-- =============================================================================
+create table scorer_evals (
+  id                      uuid primary key default gen_random_uuid(),
+  company_id              uuid references companies(id) on delete cascade,
+  evaluated_at            timestamptz default now(),
+
+  -- Snapshot counts at time of eval
+  total_swipes            integer,
+  training_swipes         integer,
+  holdout_swipes          integer,
+  holdout_rights          integer,
+
+  -- Core metric: higher is better; 1.0 = no better than random; target ≥ 1.3
+  lift_at_30              numeric,
+
+  -- Discovery metrics
+  out_of_naics_like_rate  numeric,   -- fraction of likes outside declared NAICS
+  exploration_breadth     integer,   -- unique NAICS codes in liked holdout set
+
+  -- Scorer version tag — bump when algorithm changes so history is comparable
+  scorer_version          text,
+
+  notes                   text       -- optional human annotation
+);
+
+-- Evals are scoped to the company that owns the data
+alter table scorer_evals enable row level security;
+create policy "scorer_evals: own company"
+  on scorer_evals for all using (company_id = my_company_id());
+
+
+-- =============================================================================
 -- INDEXES
 -- Tuned for the queries the app actually runs.
 -- =============================================================================

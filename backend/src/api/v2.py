@@ -691,44 +691,17 @@ def _naics_weighted_obs(naics_code: str, rights: dict, lefts: dict):
     return 0.0, 0.0  # unseen — prior will dominate
 
 
-def compute_swipe_signals(sb, company_id: str) -> dict:
+def _signals_from_swipe_list(swipes: list) -> dict:
     """
-    Compute per-company behavioral signals from swipe history.
-    Returns a signals dict cached in-memory for _SIGNAL_CACHE_TTL seconds.
+    Compute behavioral signals from a pre-fetched, chronologically ordered
+    list of swipe dicts (each with an 'opportunities' sub-dict joined in).
 
-    Signals dict keys:
-      total_swipes    — raw count
-      global_rate     — weighted right-swipe rate (used as Bayesian prior mean)
-      naics_rights    — {naics_code: weighted_rights}
-      naics_lefts     — {naics_code: weighted_lefts}
-      agency_rights   — {agency_lower: weighted_rights}
-      agency_lefts    — {agency_lower: weighted_lefts}
-      value_centroid  — geometric mean of liked opportunity values (dollars)
-      value_log_std   — std dev of log(value) across liked opportunities
+    Extracted from compute_swipe_signals so the evaluation harness can
+    compute signals for a training subset without touching the DB or cache.
     """
-    now = time.time()
-    with _signals_lock:
-        cached = _signals_cache.get(company_id)
-        if cached and now - cached["ts"] < _SIGNAL_CACHE_TTL:
-            return cached["signals"]
-
-    # Fetch most recent 2000 swipes with opportunity data joined.
-    # Ordered ASC so index == chronological position for decay calculation.
-    result = sb.table("swipes").select(
-        "opportunity_id, direction, dwell_ms, expanded, created_at, "
-        "opportunities(naics_code, agency, value_max)"
-    ).eq("company_id", company_id).in_(
-        "direction", ["left", "right"]
-    ).order("created_at", desc=False).limit(2000).execute()
-
-    swipes = result.data or []
     total = len(swipes)
-
-    _empty = {"total_swipes": 0, "global_rate": 0.08}  # 8% prior when no data
     if total == 0:
-        with _signals_lock:
-            _signals_cache[company_id] = {"ts": now, "signals": _empty}
-        return _empty
+        return {"total_swipes": 0, "global_rate": 0.08}
 
     total_w_rights = 0.0
     total_w_lefts  = 0.0
@@ -736,7 +709,7 @@ def compute_swipe_signals(sb, company_id: str) -> dict:
     naics_lefts:  dict = {}
     agency_rights: dict = {}
     agency_lefts:  dict = {}
-    liked_log_vals: list = []   # (log_value, weight) for right-swipes with a value
+    liked_log_vals: list = []
 
     for i, swipe in enumerate(swipes):
         direction  = swipe.get("direction") or ""
@@ -776,17 +749,16 @@ def compute_swipe_signals(sb, company_id: str) -> dict:
     total_w = total_w_rights + total_w_lefts
     global_rate = total_w_rights / total_w if total_w > 0 else 0.08
 
-    # Weighted mean and std dev of log(value) across liked opportunities
     value_centroid = None
-    value_log_std  = 1.2   # default ~3.3× spread if no liked values
+    value_log_std  = 1.2
     if liked_log_vals:
         w_total  = sum(w for _, w in liked_log_vals)
         mean_log = sum(lv * w for lv, w in liked_log_vals) / w_total
         var_log  = sum(w * (lv - mean_log) ** 2 for lv, w in liked_log_vals) / w_total
         value_centroid = math.exp(mean_log)
-        value_log_std  = max(math.sqrt(var_log), 0.5)  # floor at 0.5 log units
+        value_log_std  = max(math.sqrt(var_log), 0.5)
 
-    signals = {
+    return {
         "total_swipes":   total,
         "global_rate":    global_rate,
         "naics_rights":   naics_rights,
@@ -797,14 +769,172 @@ def compute_swipe_signals(sb, company_id: str) -> dict:
         "value_log_std":  value_log_std,
     }
 
+
+def compute_swipe_signals(sb, company_id: str) -> dict:
+    """
+    Compute per-company behavioral signals from swipe history.
+    Returns a signals dict cached in-memory for _SIGNAL_CACHE_TTL seconds.
+
+    Signals dict keys:
+      total_swipes    — raw count
+      global_rate     — weighted right-swipe rate (used as Bayesian prior mean)
+      naics_rights    — {naics_code: weighted_rights}
+      naics_lefts     — {naics_code: weighted_lefts}
+      agency_rights   — {agency_lower: weighted_rights}
+      agency_lefts    — {agency_lower: weighted_lefts}
+      value_centroid  — geometric mean of liked opportunity values (dollars)
+      value_log_std   — std dev of log(value) across liked opportunities
+    """
+    now = time.time()
+    with _signals_lock:
+        cached = _signals_cache.get(company_id)
+        if cached and now - cached["ts"] < _SIGNAL_CACHE_TTL:
+            return cached["signals"]
+
+    # Fetch most recent 2000 swipes with opportunity data joined.
+    # Ordered ASC so index == chronological position for decay calculation.
+    result = sb.table("swipes").select(
+        "opportunity_id, direction, dwell_ms, expanded, created_at, "
+        "opportunities(naics_code, agency, value_max)"
+    ).eq("company_id", company_id).in_(
+        "direction", ["left", "right"]
+    ).order("created_at", desc=False).limit(2000).execute()
+
+    swipes = result.data or []
+    signals = _signals_from_swipe_list(swipes)
+
     with _signals_lock:
         _signals_cache[company_id] = {"ts": now, "signals": signals}
 
     logger.info(
-        f"Swipe signals [{company_id[:8]}]: {total} swipes, "
-        f"global_rate={global_rate:.3f}, naics_tracked={len(naics_rights)}"
+        f"Swipe signals [{company_id[:8]}]: {len(swipes)} swipes, "
+        f"global_rate={signals['global_rate']:.3f}, naics_tracked={len(signals.get('naics_rights', {}))}"
     )
     return signals
+
+
+# ---------------------------------------------------------------------------
+# Evaluation harness
+# ---------------------------------------------------------------------------
+
+def evaluate_scorer(sb, company_id: str, min_holdout: int = 20) -> dict | None:
+    """
+    Temporal holdout evaluation of the feed scorer.
+
+    Splits swipe history 80% training / 20% holdout (chronological — no
+    time travel). Computes training signals from the training set, scores
+    all holdout opportunities using those signals, then measures how well
+    the scorer's ranking correlated with actual right-swipes.
+
+    Metrics returned (and logged to scorer_evals):
+      lift_at_30           — (right-swipe rate in top-30 scored holdout) /
+                             (global right-swipe rate in holdout). Baseline = 1.0.
+      out_of_naics_like_rate — fraction of holdout right-swipes on opportunities
+                               outside the company's declared NAICS codes.
+                               Tracks discovery beyond declared competencies.
+      exploration_breadth  — count of unique NAICS codes in holdout right-swipes.
+                             Higher = broader discovery.
+
+    Returns None if there aren't enough swipes to evaluate (< min_holdout in holdout,
+    or 0 right-swipes in holdout).
+    """
+    # Fetch all swipes with enough opp fields to run scoring.
+    # The joined opportunities sub-dict supplies naics, agency, and value — the
+    # three primary scoring signals. Title/description are absent, so keyword
+    # scoring won't fire; that's acceptable since Stage 3 is a placeholder anyway.
+    result = sb.table("swipes").select(
+        "opportunity_id, direction, dwell_ms, expanded, created_at, "
+        "opportunities(naics_code, agency, value_max, value_min, set_aside_type)"
+    ).eq("company_id", company_id).in_(
+        "direction", ["left", "right"]
+    ).order("created_at", desc=False).limit(5000).execute()
+
+    all_swipes = result.data or []
+    total = len(all_swipes)
+
+    split_idx = int(total * 0.8)
+    training_swipes = all_swipes[:split_idx]
+    holdout_swipes  = all_swipes[split_idx:]
+
+    holdout_rights = sum(1 for s in holdout_swipes if s.get("direction") == "right")
+
+    if len(holdout_swipes) < min_holdout:
+        logger.info(f"evaluate_scorer [{company_id[:8]}]: only {len(holdout_swipes)} holdout swipes (need {min_holdout}), skipping")
+        return None
+    if holdout_rights == 0:
+        logger.info(f"evaluate_scorer [{company_id[:8]}]: 0 right-swipes in holdout, skipping")
+        return None
+
+    # Build signals from training set only (no peeking at holdout)
+    training_signals = _signals_from_swipe_list(training_swipes)
+
+    # Build company profile for rule-based scoring
+    profile = build_company_profile(sb, company_id)
+    company_naics = {n["naics_code"] for n in profile.get("naics", [])}
+
+    # Score each holdout opportunity using training signals
+    scored_holdout = []
+    for swipe in holdout_swipes:
+        opp_data = swipe.get("opportunities") or {}
+        # Build a minimal opp dict sufficient for scoring
+        opp = {
+            "naics_code":    opp_data.get("naics_code"),
+            "agency":        opp_data.get("agency"),
+            "value_max":     opp_data.get("value_max"),
+            "value_min":     opp_data.get("value_min"),
+            "set_aside_type": opp_data.get("set_aside_type"),
+        }
+        score = score_opportunity(opp, profile, training_signals)
+        scored_holdout.append({
+            "score":      score,
+            "direction":  swipe.get("direction"),
+            "naics_code": opp_data.get("naics_code") or "",
+        })
+
+    # Sort by predicted score descending — this is what the feed would have shown
+    scored_holdout.sort(key=lambda x: x["score"], reverse=True)
+
+    # Lift@30: right-swipe rate in predicted top-30 vs. overall holdout rate
+    top_n = min(30, len(scored_holdout))
+    top_slice = scored_holdout[:top_n]
+    top_rights = sum(1 for h in top_slice if h["direction"] == "right")
+    top_rate   = top_rights / top_n
+    global_rate = holdout_rights / len(holdout_swipes)
+    lift_at_30  = round(top_rate / global_rate, 4) if global_rate > 0 else 1.0
+
+    # Out-of-NAICS like rate: fraction of right-swipes on non-company NAICS
+    out_of_naics_rights = sum(
+        1 for h in scored_holdout
+        if h["direction"] == "right" and h["naics_code"] not in company_naics
+    )
+    out_of_naics_like_rate = round(out_of_naics_rights / holdout_rights, 4)
+
+    # Exploration breadth: unique NAICS codes among holdout right-swipes
+    liked_naics = {h["naics_code"] for h in scored_holdout if h["direction"] == "right" and h["naics_code"]}
+    exploration_breadth = len(liked_naics)
+
+    metrics = {
+        "company_id":             company_id,
+        "total_swipes":           total,
+        "training_swipes":        split_idx,
+        "holdout_swipes":         len(holdout_swipes),
+        "holdout_rights":         holdout_rights,
+        "lift_at_30":             lift_at_30,
+        "out_of_naics_like_rate": out_of_naics_like_rate,
+        "exploration_breadth":    exploration_breadth,
+        "scorer_version":         "v2-behavioral-stage2",
+    }
+
+    try:
+        sb.table("scorer_evals").insert(metrics).execute()
+        logger.info(
+            f"evaluate_scorer [{company_id[:8]}]: lift@30={lift_at_30:.3f}, "
+            f"out_of_naics={out_of_naics_like_rate:.3f}, breadth={exploration_breadth}"
+        )
+    except Exception as e:
+        logger.warning(f"evaluate_scorer: failed to log to scorer_evals: {e}")
+
+    return metrics
 
 
 # ── Behavioral component scorers ────────────────────────────────────────────
@@ -2098,6 +2228,51 @@ def register():
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
+
+@app.route("/api/v2/eval", methods=["GET"])
+@require_auth
+def run_eval():
+    """
+    Run the scorer evaluation harness for the authenticated user's company.
+
+    Returns Lift@30, out-of-NAICS like rate, and exploration breadth.
+    Also returns the 10 most recent historical eval records so you can
+    track whether the scorer is improving over time.
+
+    Requires at least 50 total swipes (so the 20% holdout has ≥10 records).
+    """
+    user_id = get_user_id()
+    sb = get_sb()
+
+    user_row = sb.table("users").select("company_id").eq("id", user_id).single().execute()
+    if not user_row.data:
+        return jsonify({"error": "User not found"}), 404
+    company_id = user_row.data["company_id"]
+
+    result = evaluate_scorer(sb, company_id)
+    if result is None:
+        return jsonify({
+            "error": "Not enough swipe data to evaluate. Need at least 50 total swipes with at least one right-swipe in the holdout set."
+        }), 422
+
+    # Fetch recent eval history for this company
+    history = sb.table("scorer_evals").select(
+        "evaluated_at, lift_at_30, out_of_naics_like_rate, exploration_breadth, "
+        "total_swipes, holdout_rights, scorer_version"
+    ).eq("company_id", company_id).order(
+        "evaluated_at", desc=True
+    ).limit(10).execute()
+
+    return jsonify({
+        "latest": result,
+        "history": history.data or [],
+        "interpretation": {
+            "lift_at_30": "Ratio of right-swipe rate in top 30 predicted cards vs. baseline. >1.0 means the scorer is better than random. Target: ≥1.3.",
+            "out_of_naics_like_rate": "Fraction of liked opportunities outside your declared NAICS codes. Higher = more discovery.",
+            "exploration_breadth": "Count of unique NAICS codes in your liked holdout set. Higher = broader discovery.",
+        }
+    })
+
 
 @app.route("/api/v2/health", methods=["GET"])
 def health():
