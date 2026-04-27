@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { db } from '../lib/api'
 
@@ -7,6 +7,12 @@ async function signOut() {
 }
 
 const STEPS = ['Company basics', 'What you pursue', 'Capabilities', 'Exclusions']
+
+function readDraft(userId) {
+  try {
+    return JSON.parse(localStorage.getItem(`govscroll_onboarding_${userId}`) || 'null')
+  } catch { return null }
+}
 
 const SET_ASIDES = [
   { value: 'small_business', label: 'Small Business' },
@@ -17,31 +23,59 @@ const SET_ASIDES = [
 ]
 
 export default function Onboarding({ user, company, onComplete }) {
+  const draftKey = `govscroll_onboarding_${user.id}`
+
   const [step, setStep] = useState((company?.onboarding_step || 1) - 1)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [currentCompany, setCurrentCompany] = useState(company)
-  const [companyNameInput, setCompanyNameInput] = useState(company?.name || '')
 
-  // Step 1 state
-  const [contractMin, setContractMin] = useState(company?.contract_min || '')
-  const [contractMax, setContractMax] = useState(company?.contract_max || '')
-  const [primeSubPref, setPrimeSubPref] = useState(company?.prime_sub_preference || 'both')
-  const [clearance, setClearance] = useState(company?.clearance_level || 'none')
-  const [selectedSetAsides, setSelectedSetAsides] = useState(company?.set_aside_eligibility || [])
-
-  // Step 2 state
+  // All form state is initialized from localStorage draft first, then company prop.
+  // This survives iOS Safari tab eviction and any other page reload mid-onboarding.
+  const [companyNameInput, setCompanyNameInput] = useState(() => {
+    const d = readDraft(user.id); return d?.companyNameInput ?? company?.name ?? ''
+  })
+  const [contractMin, setContractMin] = useState(() => {
+    const d = readDraft(user.id); return d?.contractMin ?? (company?.contract_min != null ? String(company.contract_min) : '')
+  })
+  const [contractMax, setContractMax] = useState(() => {
+    const d = readDraft(user.id); return d?.contractMax ?? (company?.contract_max != null ? String(company.contract_max) : '')
+  })
+  const [primeSubPref, setPrimeSubPref] = useState(() => {
+    const d = readDraft(user.id); return d?.primeSubPref ?? company?.prime_sub_preference ?? 'both'
+  })
+  const [clearance, setClearance] = useState(() => {
+    const d = readDraft(user.id); return d?.clearance ?? company?.clearance_level ?? 'none'
+  })
+  const [selectedSetAsides, setSelectedSetAsides] = useState(() => {
+    const d = readDraft(user.id); return d?.selectedSetAsides ?? company?.set_aside_eligibility ?? []
+  })
   const [naicsInput, setNaicsInput] = useState('')
-  const [naicsList, setNaicsList] = useState([])
-
-  // Step 3 state
-  const [capStatement, setCapStatement] = useState(company?.capabilities_statement || '')
+  const [naicsList, setNaicsList] = useState(() => {
+    const d = readDraft(user.id); return d?.naicsList ?? []
+  })
+  const [capStatement, setCapStatement] = useState(() => {
+    const d = readDraft(user.id); return d?.capStatement ?? company?.capabilities_statement ?? ''
+  })
   const [keywordInput, setKeywordInput] = useState('')
-  const [keywords, setKeywords] = useState([])
-
-  // Step 4 state
+  const [keywords, setKeywords] = useState(() => {
+    const d = readDraft(user.id); return d?.keywords ?? []
+  })
   const [excludeKeywordInput, setExcludeKeywordInput] = useState('')
-  const [excludeKeywords, setExcludeKeywords] = useState([])
+  const [excludeKeywords, setExcludeKeywords] = useState(() => {
+    const d = readDraft(user.id); return d?.excludeKeywords ?? []
+  })
+
+  // Persist entire draft to localStorage on every field change
+  useEffect(() => {
+    try {
+      localStorage.setItem(draftKey, JSON.stringify({
+        companyNameInput, contractMin, contractMax, primeSubPref, clearance,
+        selectedSetAsides, naicsList, capStatement, keywords, excludeKeywords,
+      }))
+    } catch {}
+  }, [companyNameInput, contractMin, contractMax, primeSubPref, clearance,
+      selectedSetAsides, naicsList, capStatement, keywords, excludeKeywords])
 
   function toggleSetAside(val) {
     setSelectedSetAsides(prev =>
@@ -89,9 +123,14 @@ export default function Onboarding({ user, company, onComplete }) {
         companyId = result.company.id
       }
       if (step === 0) {
+        const min = contractMin !== '' ? Number(contractMin) : null
+        const max = contractMax !== '' ? Number(contractMax) : null
+        if (contractMin !== '' && isNaN(min)) throw new Error('Minimum contract value must be a number.')
+        if (contractMax !== '' && isNaN(max)) throw new Error('Maximum contract value must be a number.')
+        if (min !== null && max !== null && min > max) throw new Error('Minimum cannot be greater than maximum.')
         const { error: e } = await db.saveCompany(companyId, {
-          contract_min: contractMin ? Number(contractMin) : null,
-          contract_max: contractMax ? Number(contractMax) : null,
+          contract_min: min,
+          contract_max: max,
           prime_sub_preference: primeSubPref,
           clearance_level: clearance,
           set_aside_eligibility: selectedSetAsides,
@@ -104,12 +143,11 @@ export default function Onboarding({ user, company, onComplete }) {
         const { error: e2 } = await db.saveCompany(companyId, { onboarding_step: 3 })
         if (e2) throw new Error(e2.message)
       } else if (step === 2) {
-        const { error: e1 } = await db.saveCompany(companyId, { capabilities_statement: capStatement, onboarding_step: 4 })
-        if (e1) throw new Error(e1.message)
-        const allKeywords = keywords.map(k => ({ keyword: k, is_exclusion: false }))
-        const { error: e2 } = await db.saveKeywords(companyId, allKeywords)
-        if (e2) throw new Error(e2.message)
+        // Keywords saved in step 3 alongside exclusions — only save capStatement here
+        const { error: e } = await db.saveCompany(companyId, { capabilities_statement: capStatement, onboarding_step: 4 })
+        if (e) throw new Error(e.message)
       } else if (step === 3) {
+        // Save all keywords (regular + exclusion) in one shot to avoid double-save race
         const allKeywords = [
           ...keywords.map(k => ({ keyword: k, is_exclusion: false })),
           ...excludeKeywords.map(k => ({ keyword: k, is_exclusion: true })),
@@ -118,6 +156,7 @@ export default function Onboarding({ user, company, onComplete }) {
         if (e1) throw new Error(e1.message)
         const { error: e2 } = await db.saveCompany(companyId, { onboarding_complete: true, onboarding_step: 4 })
         if (e2) throw new Error(e2.message)
+        localStorage.removeItem(draftKey)
         onComplete()
         return
       }
