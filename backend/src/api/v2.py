@@ -2289,6 +2289,79 @@ def run_eval():
     })
 
 
+@app.route("/api/v2/company/analyze-capabilities", methods=["POST"])
+@require_auth
+def analyze_capabilities():
+    """
+    Use Claude Opus to suggest NAICS codes from a free-text capabilities statement.
+    Returns up to 8 suggested codes with descriptions and brief reasons.
+    One-time operation — use a high-quality model since accuracy matters here.
+    """
+    data = request.get_json()
+    text = (data or {}).get("text", "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    if len(text) > 10000:
+        return jsonify({"error": "text too long (max 10,000 chars)"}), 400
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        prompt = f"""You are a federal contracting expert with deep knowledge of NAICS codes.
+
+A company has provided the following capabilities statement:
+
+---
+{text}
+---
+
+Identify the 5-8 NAICS codes that best match this company's work and would make them competitive for federal contracts. Use your knowledge of official NAICS titles.
+
+Return ONLY a valid JSON array — no preamble, no markdown, no explanation outside the JSON. Each item must have exactly these three keys:
+- "code": the 6-digit NAICS code as a string
+- "description": the official NAICS title (short, ≤10 words)
+- "reason": one sentence (≤15 words) explaining why this code applies
+
+Example:
+[{{"code": "541715", "description": "Research and Development in Physical Sciences", "reason": "Core R&D services mentioned throughout the statement"}}]"""
+
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+
+        # Strip markdown code fences if model wrapped the JSON
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+
+        suggestions = json.loads(raw)
+        if not isinstance(suggestions, list):
+            raise ValueError("Expected a JSON array")
+
+        # Validate and sanitize each item
+        clean = []
+        for s in suggestions:
+            code = str(s.get("code", "")).strip().replace("-", "")
+            if len(code) == 6 and code.isdigit():
+                clean.append({
+                    "code": code,
+                    "description": str(s.get("description", ""))[:120],
+                    "reason": str(s.get("reason", ""))[:200],
+                })
+        return jsonify({"suggestions": clean})
+
+    except json.JSONDecodeError as e:
+        logger.error(f"analyze_capabilities: Claude returned invalid JSON: {e} — raw: {raw[:200]}")
+        return jsonify({"error": "AI returned unexpected format. Please try again."}), 500
+    except Exception as e:
+        logger.error(f"analyze_capabilities failed: {e}")
+        return jsonify({"error": "Analysis failed. Check Anthropic API key."}), 500
+
+
 @app.route("/api/v2/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "version": "2.0"})

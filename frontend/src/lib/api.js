@@ -37,6 +37,7 @@ export const api = {
 
   // Company profile
   getProfile: () => get('/api/v2/company/profile'),
+  analyzeCapabilities: (text) => post('/api/v2/company/analyze-capabilities', { text }),
 
   // Health
   health: () => get('/api/v2/health'),

@@ -43,7 +43,7 @@ SAM_API_BASE = "https://api.sam.gov/opportunities/v2/search"
 SAM_DESC_BASE = "https://api.sam.gov/prod/opportunities/v1/noticedesc"
 BATCH_SIZE = 1000       # SAM.gov max per page
 UPSERT_BATCH = 250      # rows per Supabase upsert call
-DESC_WORKERS = 10       # parallel description fetches
+DESC_WORKERS = 2        # parallel description fetches (keep low — SAM.gov rate limit ~1 req/s)
 DESC_MAX_CHARS = 50_000 # store up to 50k chars of description text
 LAST_RUN_FILE = Path(__file__).resolve().parents[3] / "data" / "last_ingest.txt"
 
@@ -68,9 +68,12 @@ def get_sam_api_key() -> str:
 # ---------------------------------------------------------------------------
 
 def _strip_html(text: str) -> str:
-    """Remove HTML tags and normalize whitespace."""
+    """Remove HTML tags, normalize whitespace, and strip Postgres-incompatible control chars."""
     text = re.sub(r'<[^>]+>', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
+    # Remove null bytes and other control characters Postgres rejects
+    # (keep \t \n \r which are valid in text columns)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     return text
 
 
@@ -88,13 +91,21 @@ def fetch_description(notice_id: str, api_key: str) -> str | None:
             timeout=15,
         )
         if resp.status_code != 200:
+            logger.debug(f"fetch_description {notice_id}: HTTP {resp.status_code} — {resp.text[:200]}")
             return None
         data = resp.json()
-        raw = data.get("description") or data.get("body") or ""
+        # SAM.gov noticedesc returns a list of description objects
+        if isinstance(data, list):
+            parts = [item.get("description") or item.get("body") or "" for item in data]
+            raw = " ".join(p for p in parts if p)
+        else:
+            raw = data.get("description") or data.get("body") or ""
         if not raw:
+            logger.debug(f"fetch_description {notice_id}: 200 OK but no description field. Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
             return None
         return _strip_html(raw)[:DESC_MAX_CHARS]
-    except Exception:
+    except Exception as e:
+        logger.debug(f"fetch_description {notice_id}: exception — {e}")
         return None
 
 
@@ -505,6 +516,7 @@ def run_backfill_descriptions():
 
     def _fetch_and_update(stub):
         text = fetch_description(stub["notice_id"], api_key)
+        time.sleep(0.5)  # throttle regardless of success/failure — ~1 req/s per worker
         if not text:
             return False
         try:
@@ -515,6 +527,23 @@ def run_backfill_descriptions():
         except Exception as e:
             logger.warning(f"Update failed for {stub['notice_id']}: {e}")
             return False
+
+    # Sanity check: verify the API works before processing 40k+ records
+    logger.info("Sanity-checking noticedesc API with first record...")
+    test_stub = all_stubs[0]
+    test_text = fetch_description(test_stub["notice_id"], api_key)
+    if test_text is None:
+        # Run with DEBUG logging to see the actual error
+        logging.getLogger().setLevel(logging.DEBUG)
+        fetch_description(test_stub["notice_id"], api_key)
+        logging.getLogger().setLevel(logging.INFO)
+        logger.error(
+            f"API sanity check failed for notice_id={test_stub['notice_id']}. "
+            "Check the DEBUG output above. Possible causes: rate limit still active from "
+            "previous run (try again tomorrow), API key invalid, or wrong endpoint URL."
+        )
+        return
+    logger.info(f"API check OK — got {len(test_text)} chars for first record. Starting full backfill...")
 
     with ThreadPoolExecutor(max_workers=DESC_WORKERS) as pool:
         futures = [pool.submit(_fetch_and_update, stub) for stub in all_stubs]

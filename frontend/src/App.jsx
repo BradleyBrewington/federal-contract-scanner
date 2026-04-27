@@ -3,12 +3,14 @@ import { supabase } from './lib/supabase'
 import Login from './pages/Login'
 import Onboarding from './pages/Onboarding'
 import Feed from './pages/Feed'
+import ProfileModal from './components/ProfileModal'
 
 export default function App() {
   const [session, setSession] = useState(undefined)  // undefined = loading
   const [user, setUser] = useState(null)
   const [company, setCompany] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [showProfile, setShowProfile] = useState(false)
 
   // Listen to auth state changes
   useEffect(() => {
@@ -89,7 +91,7 @@ export default function App() {
           <span style={appStyles.navLogoText}>GovScroll</span>
         </div>
         <div style={appStyles.navRight}>
-          <span style={appStyles.companyName}>{company?.name}</span>
+          <button style={appStyles.companyBtn} onClick={() => setShowProfile(true)}>{company?.name}</button>
           <button style={appStyles.signOutBtn} onClick={handleSignOut}>Sign out</button>
         </div>
       </nav>
@@ -108,6 +110,10 @@ export default function App() {
       <main style={appStyles.main}>
         <Feed user={user} company={company} />
       </main>
+
+      {showProfile && (
+        <ProfileModal company={company} onClose={() => setShowProfile(false)} />
+      )}
     </div>
   )
 }
@@ -143,7 +149,16 @@ const appStyles = {
   navLogo: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '18px', fontWeight: '700' },
   navLogoText: { color: 'var(--text)' },
   navRight: { display: 'flex', alignItems: 'center', gap: '14px' },
-  companyName: { fontSize: '13px', color: 'var(--muted)' },
+  companyBtn: {
+    background: 'none',
+    border: 'none',
+    fontSize: '13px',
+    color: 'var(--muted)',
+    cursor: 'pointer',
+    padding: '6px 8px',
+    borderRadius: '6px',
+    transition: 'color 0.15s',
+  },
   signOutBtn: {
     background: 'var(--surface2)',
     color: 'var(--muted)',
