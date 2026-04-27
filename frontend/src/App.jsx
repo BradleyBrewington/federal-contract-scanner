@@ -14,34 +14,40 @@ export default function App() {
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session)
-      if (session) loadUserData(session.user.id)
+      if (session) loadUserData(session.user.id, session.user)
       else setLoading(false)
     })
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session)
-      if (session) loadUserData(session.user.id)
+      if (session) loadUserData(session.user.id, session.user)
       else { setUser(null); setCompany(null); setLoading(false) }
     })
 
     return () => subscription.unsubscribe()
   }, [])
 
-  async function loadUserData(userId) {
+  async function loadUserData(userId, authUser = null) {
     setLoading(true)
     try {
       const { data: userData } = await supabase
         .from('users')
         .select('*, companies(*)')
         .eq('id', userId)
-        .single()
+        .maybeSingle()
 
       if (userData) {
         setUser(userData)
         setCompany(userData.companies)
+      } else {
+        // New user — DB row not created yet (happens after register call in Onboarding).
+        // Fall back to the auth user object so Onboarding has access to .id and .email.
+        setUser(authUser)
+        setCompany(null)
       }
     } catch (err) {
       console.error('Failed to load user data:', err)
+      setUser(authUser)
     } finally {
       setLoading(false)
     }

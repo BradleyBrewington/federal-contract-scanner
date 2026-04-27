@@ -23,7 +23,7 @@ const SET_ASIDES = [
 ]
 
 export default function Onboarding({ user, company, onComplete }) {
-  const draftKey = `govscroll_onboarding_${user.id}`
+  const draftKey = `govscroll_onboarding_${user?.id}`
 
   const [step, setStep] = useState((company?.onboarding_step || 1) - 1)
   const [saving, setSaving] = useState(false)
@@ -33,37 +33,37 @@ export default function Onboarding({ user, company, onComplete }) {
   // All form state is initialized from localStorage draft first, then company prop.
   // This survives iOS Safari tab eviction and any other page reload mid-onboarding.
   const [companyNameInput, setCompanyNameInput] = useState(() => {
-    const d = readDraft(user.id); return d?.companyNameInput ?? company?.name ?? ''
+    const d = readDraft(user?.id); return d?.companyNameInput ?? company?.name ?? ''
   })
   const [contractMin, setContractMin] = useState(() => {
-    const d = readDraft(user.id); return d?.contractMin ?? (company?.contract_min != null ? String(company.contract_min) : '')
+    const d = readDraft(user?.id); return d?.contractMin ?? (company?.contract_min != null ? String(company.contract_min) : '')
   })
   const [contractMax, setContractMax] = useState(() => {
-    const d = readDraft(user.id); return d?.contractMax ?? (company?.contract_max != null ? String(company.contract_max) : '')
+    const d = readDraft(user?.id); return d?.contractMax ?? (company?.contract_max != null ? String(company.contract_max) : '')
   })
   const [primeSubPref, setPrimeSubPref] = useState(() => {
-    const d = readDraft(user.id); return d?.primeSubPref ?? company?.prime_sub_preference ?? 'both'
+    const d = readDraft(user?.id); return d?.primeSubPref ?? company?.prime_sub_preference ?? 'both'
   })
   const [clearance, setClearance] = useState(() => {
-    const d = readDraft(user.id); return d?.clearance ?? company?.clearance_level ?? 'none'
+    const d = readDraft(user?.id); return d?.clearance ?? company?.clearance_level ?? 'none'
   })
   const [selectedSetAsides, setSelectedSetAsides] = useState(() => {
-    const d = readDraft(user.id); return d?.selectedSetAsides ?? company?.set_aside_eligibility ?? []
+    const d = readDraft(user?.id); return d?.selectedSetAsides ?? company?.set_aside_eligibility ?? []
   })
   const [naicsInput, setNaicsInput] = useState('')
   const [naicsList, setNaicsList] = useState(() => {
-    const d = readDraft(user.id); return d?.naicsList ?? []
+    const d = readDraft(user?.id); return d?.naicsList ?? []
   })
   const [capStatement, setCapStatement] = useState(() => {
-    const d = readDraft(user.id); return d?.capStatement ?? company?.capabilities_statement ?? ''
+    const d = readDraft(user?.id); return d?.capStatement ?? company?.capabilities_statement ?? ''
   })
   const [keywordInput, setKeywordInput] = useState('')
   const [keywords, setKeywords] = useState(() => {
-    const d = readDraft(user.id); return d?.keywords ?? []
+    const d = readDraft(user?.id); return d?.keywords ?? []
   })
   const [excludeKeywordInput, setExcludeKeywordInput] = useState('')
   const [excludeKeywords, setExcludeKeywords] = useState(() => {
-    const d = readDraft(user.id); return d?.excludeKeywords ?? []
+    const d = readDraft(user?.id); return d?.excludeKeywords ?? []
   })
 
   // Persist entire draft to localStorage on every field change
