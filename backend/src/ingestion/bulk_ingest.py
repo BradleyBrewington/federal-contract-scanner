@@ -304,7 +304,7 @@ def parse_opportunity(raw: dict) -> dict:
         "posted_date": parse_date(raw.get("postedDate")),
         "response_deadline": parse_date(raw.get("responseDeadLine")),
         "modified_date": parse_date(raw.get("modifiedDate")),
-        "status": "active",
+        "status": "active" if raw.get("active", "Yes") == "Yes" else "inactive",
         "source": "sam_gov",
         "attachments": json.dumps(attachments),
         "raw_data": json.dumps(raw),
