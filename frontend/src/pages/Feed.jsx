@@ -47,9 +47,11 @@ export default function Feed({ user, company }) {
   const [savedCount, setSavedCount] = useState(0)
   const [bookmarkCount, setBookmarkCount] = useState(0)
 
-  const cardRefs     = useRef([])  // TinderCard refs (for programmatic swipe)
-  const cardHintRefs = useRef([])  // OpportunityCard refs (for imperative setHint)
+  const cardRefs       = useRef([])        // TinderCard refs (for programmatic swipe)
+  const cardHintRefs   = useRef([])        // OpportunityCard refs (for imperative setHint)
   const swipeStartTime = useRef(null)
+  const expandedCardIds   = useRef(new Set())  // cards where user opened the detail modal
+  const samClickedCardIds = useRef(new Set())  // cards where user clicked the SAM.gov link
 
   const currentIndex = cards.length - 1
 
@@ -134,7 +136,8 @@ export default function Feed({ user, company }) {
       opportunityId: card.id,
       direction,
       dwellMs,
-      expanded: false,
+      expanded: expandedCardIds.current.has(card.id),
+      samLinkClicked: samClickedCardIds.current.has(card.id),
     }).catch(err => console.error('Swipe record failed:', err))
 
     if (direction === 'right') {
@@ -168,7 +171,8 @@ export default function Feed({ user, company }) {
         opportunityId: card.id,
         direction: 'right',
         dwellMs,
-        expanded: false,
+        expanded: expandedCardIds.current.has(card.id),
+        samLinkClicked: samClickedCardIds.current.has(card.id),
       }).catch(err => console.error('Save swipe record failed:', err))
 
       db.addToPipeline({
@@ -229,12 +233,8 @@ export default function Feed({ user, company }) {
 
   const handleExpand = useCallback((card) => {
     setExpandedCard(card)
-    db.recordDetailView({
-      userId: user.id,
-      companyId: company.id,
-      opportunityId: card.id,
-    }).catch(() => {})
-  }, [user.id, company.id])
+    expandedCardIds.current.add(card.id)
+  }, [])
 
   const handleRemoveFromSaved = useCallback(() => {
     setSavedCount(prev => Math.max(0, prev - 1))
@@ -363,6 +363,7 @@ export default function Feed({ user, company }) {
                 target="_blank"
                 rel="noreferrer"
                 style={styles.cardActionLink}
+                onClick={() => samClickedCardIds.current.add(cards[currentIndex].id)}
               >
                 SAM.gov ↗
               </a>

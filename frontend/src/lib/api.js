@@ -45,7 +45,7 @@ export const api = {
 // Supabase direct writes (no Flask needed for simple CRUD)
 export const db = {
   // Record a swipe
-  recordSwipe: async ({ userId, companyId, opportunityId, direction, dwellMs, expanded }) => {
+  recordSwipe: async ({ userId, companyId, opportunityId, direction, dwellMs, expanded, samLinkClicked }) => {
     return supabase.from('swipes').upsert({
       user_id: userId,
       company_id: companyId,
@@ -53,6 +53,7 @@ export const db = {
       direction,
       dwell_ms: dwellMs,
       expanded,
+      sam_link_clicked: samLinkClicked || false,
     }, { onConflict: 'user_id,opportunity_id' })
   },
 

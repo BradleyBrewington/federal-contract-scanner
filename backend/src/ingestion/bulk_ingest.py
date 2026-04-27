@@ -15,11 +15,13 @@ them into Supabase. Designed to run two ways:
 
 import os
 import sys
+import re
 import json
 import logging
 import argparse
 import time
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -38,8 +40,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SAM_API_BASE = "https://api.sam.gov/opportunities/v2/search"
+SAM_DESC_BASE = "https://api.sam.gov/prod/opportunities/v1/noticedesc"
 BATCH_SIZE = 1000       # SAM.gov max per page
 UPSERT_BATCH = 250      # rows per Supabase upsert call
+DESC_WORKERS = 10       # parallel description fetches
+DESC_MAX_CHARS = 50_000 # store up to 50k chars of description text
 LAST_RUN_FILE = Path(__file__).resolve().parents[3] / "data" / "last_ingest.txt"
 
 
@@ -56,6 +61,80 @@ def get_sam_api_key() -> str:
     if not key:
         raise RuntimeError("SAM_API_KEY must be set in .env")
     return key
+
+
+# ---------------------------------------------------------------------------
+# Description fetching
+# ---------------------------------------------------------------------------
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags and normalize whitespace."""
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def fetch_description(notice_id: str, api_key: str) -> str | None:
+    """
+    Fetch the full description text for a SAM.gov notice.
+    Returns cleaned plain text, or None on failure.
+    """
+    if not notice_id:
+        return None
+    try:
+        resp = requests.get(
+            SAM_DESC_BASE,
+            params={"noticeid": notice_id, "api_key": api_key},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        raw = data.get("description") or data.get("body") or ""
+        if not raw:
+            return None
+        return _strip_html(raw)[:DESC_MAX_CHARS]
+    except Exception:
+        return None
+
+
+def enrich_descriptions(parsed_records: list[dict], api_key: str) -> list[dict]:
+    """
+    For any record whose description field is a URL (not real text), fetch the
+    actual description text from SAM.gov and replace it in-place.
+
+    Uses a thread pool so the full delta batch is enriched in parallel.
+    Records whose fetch fails are left with their original URL value so the
+    serve-time fallback in v2.py can retry on first load.
+    """
+    url_records = [r for r in parsed_records if (r.get("description") or "").startswith("http")]
+    if not url_records:
+        return parsed_records
+
+    logger.info(f"Fetching descriptions for {len(url_records)} records ({DESC_WORKERS} workers)...")
+    fetched = 0
+    failed  = 0
+
+    def _fetch(record):
+        text = fetch_description(record.get("notice_id", ""), api_key)
+        return record["notice_id"], text
+
+    with ThreadPoolExecutor(max_workers=DESC_WORKERS) as pool:
+        futures = {pool.submit(_fetch, r): r for r in url_records}
+        for future in as_completed(futures):
+            notice_id, text = future.result()
+            if text:
+                # Find the record and update its description in-place
+                for r in parsed_records:
+                    if r.get("notice_id") == notice_id:
+                        r["description"] = text
+                        break
+                fetched += 1
+            else:
+                failed += 1
+
+    logger.info(f"Description enrichment: {fetched} fetched, {failed} failed/skipped")
+    return parsed_records
 
 
 # ---------------------------------------------------------------------------
@@ -369,20 +448,99 @@ def run_delta_load():
         return
 
     parsed = [parse_opportunity(r) for r in raw_records if r.get("noticeId")]
+
+    # Fetch real description text for any records that only have a SAM.gov URL.
+    # Delta batches are typically small (50–500 records) so this adds <1 minute.
+    parsed = enrich_descriptions(parsed, api_key)
+
     written = upsert_all(supabase, parsed)
 
     write_last_run()
     logger.info(f"=== DELTA LOAD complete: {written:,} records written ===")
 
 
+def run_backfill_descriptions():
+    """
+    One-time backfill: fetch real description text for all existing DB records
+    whose description field is still a SAM.gov API URL.
+
+    Run after initial ingestion:
+      py -3 backend/src/ingestion/bulk_ingest.py --backfill-descriptions
+
+    With DESC_WORKERS=10 and ~35k URL records, expect roughly 45–90 minutes.
+    Safe to interrupt and re-run — already-fixed records won't match the URL filter.
+    """
+    logger.info("=== DESCRIPTION BACKFILL starting ===")
+    supabase = get_supabase()
+    api_key  = get_sam_api_key()
+
+    # Collect all records where description is still a SAM.gov URL
+    all_stubs = []
+    offset = 0
+    page_size = 1000
+    while True:
+        batch = (
+            supabase.table("opportunities")
+            .select("id, notice_id")
+            .ilike("description", "http%")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = batch.data or []
+        if not rows:
+            break
+        all_stubs.extend(rows)
+        logger.info(f"Found {len(all_stubs):,} URL-description records so far...")
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    if not all_stubs:
+        logger.info("No URL-description records found — backfill already complete.")
+        return
+
+    logger.info(f"Backfilling descriptions for {len(all_stubs):,} records ({DESC_WORKERS} workers)...")
+    fetched = 0
+    failed  = 0
+
+    def _fetch_and_update(stub):
+        text = fetch_description(stub["notice_id"], api_key)
+        if not text:
+            return False
+        try:
+            supabase.table("opportunities").update(
+                {"description": text}
+            ).eq("id", stub["id"]).execute()
+            return True
+        except Exception as e:
+            logger.warning(f"Update failed for {stub['notice_id']}: {e}")
+            return False
+
+    with ThreadPoolExecutor(max_workers=DESC_WORKERS) as pool:
+        futures = [pool.submit(_fetch_and_update, stub) for stub in all_stubs]
+        for i, future in enumerate(as_completed(futures), 1):
+            if future.result():
+                fetched += 1
+            else:
+                failed += 1
+            if i % 500 == 0:
+                logger.info(f"Progress: {i:,} / {len(all_stubs):,} ({fetched} fetched, {failed} failed)")
+
+    logger.info(f"=== DESCRIPTION BACKFILL complete: {fetched:,} fetched, {failed:,} failed ===")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SAM.gov bulk ingestion pipeline")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--full", action="store_true", help="Full load: all opportunities from past 365 days")
+    group.add_argument("--full",  action="store_true", help="Full load: all opportunities from past 365 days")
     group.add_argument("--delta", action="store_true", help="Delta load: only records modified since last run")
+    group.add_argument("--backfill-descriptions", action="store_true",
+                       help="One-time: fetch real description text for all DB records that still have a SAM.gov URL")
     args = parser.parse_args()
 
     if args.full:
         run_full_load()
     elif args.delta:
         run_delta_load()
+    elif args.backfill_descriptions:
+        run_backfill_descriptions()

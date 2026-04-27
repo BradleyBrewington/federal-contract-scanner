@@ -168,13 +168,17 @@ create table swipes (
   user_id         uuid not null references users(id) on delete cascade,
   company_id      uuid not null references companies(id) on delete cascade,
   opportunity_id  uuid not null references opportunities(id) on delete cascade,
-  direction       text not null check (direction in ('right', 'left')),
-  dwell_ms        integer,            -- milliseconds spent on card before swiping
-  expanded        boolean default false,  -- did they open the detail view?
-  created_at      timestamptz default now(),
+  direction         text not null check (direction in ('right', 'left')),
+  dwell_ms          integer,               -- milliseconds spent on card before swiping
+  expanded          boolean default false, -- did they open the detail view?
+  sam_link_clicked  boolean default false, -- did they click through to SAM.gov?
+  created_at        timestamptz default now(),
 
   unique (user_id, opportunity_id)    -- one swipe per user per opportunity
 );
+
+-- Migration for existing deployments (safe to re-run — IF NOT EXISTS):
+-- alter table swipes add column if not exists sam_link_clicked boolean default false;
 
 
 -- =============================================================================

@@ -630,22 +630,36 @@ def require_auth(f):
 
 # ── Swipe signal helpers ────────────────────────────────────────────────────
 
-def _dwell_weight(dwell_ms, direction: str, expanded: bool) -> float:
+def _dwell_weight(dwell_ms, direction: str, expanded: bool, sam_link_clicked: bool = False) -> float:
     """
     Weight a single swipe by signal quality.
     High dwell + deliberate action = stronger signal.
     Fast reflexive swipes carry less weight.
+
+    Signal hierarchy (right-swipes):
+      sam_link_clicked + right → 2.5  went to source on SAM.gov AND saved — highest intent
+      expanded         + right → 2.0  opened detail modal then saved
+      dwell ≥ 5s       + right → 1.5  careful read, then saved
+      fast             + right → 0.5  quick pass
+
+    Signal hierarchy (left-swipes):
+      sam_link_clicked + left  → 1.8  went to source, still passed — very strong negative
+      dwell ≥ 10s      + left  → 1.5  careful read, rejected
+      normal           + left  → 1.0  considered and rejected
+      fast (<2s)       + left  → 0.2  reflexive pass — very weak
     """
     dwell_s = (dwell_ms / 1000.0) if dwell_ms else 3.0  # assume 3s if missing
 
     if direction == "right":
-        if expanded:    return 2.0   # opened detail view then saved — strongest signal
-        if dwell_s >= 5: return 1.5  # looked carefully, then saved
-        return 0.5                    # fast save — moderate signal
+        if sam_link_clicked: return 2.5  # clicked through to source AND saved
+        if expanded:         return 2.0  # opened detail view then saved
+        if dwell_s >= 5:     return 1.5  # looked carefully, then saved
+        return 0.5                        # fast save — moderate signal
     else:  # left
-        if dwell_s < 2:  return 0.2  # reflexive pass — very weak negative
-        if dwell_s >= 10: return 1.5 # read it carefully, still passed — strong negative
-        return 1.0                    # considered and rejected — standard negative
+        if sam_link_clicked: return 1.8  # went to source, still passed — strong negative
+        if dwell_s < 2:      return 0.2  # reflexive pass — very weak negative
+        if dwell_s >= 10:    return 1.5  # read it carefully, still passed — strong negative
+        return 1.0                        # considered and rejected — standard negative
 
 
 def _time_decay(created_at_str, swipes_ago: int) -> float:
@@ -712,13 +726,14 @@ def _signals_from_swipe_list(swipes: list) -> dict:
     liked_log_vals: list = []
 
     for i, swipe in enumerate(swipes):
-        direction  = swipe.get("direction") or ""
-        dwell_ms   = swipe.get("dwell_ms")
-        expanded   = bool(swipe.get("expanded"))
-        created_at = swipe.get("created_at")
-        opp        = swipe.get("opportunities") or {}
+        direction       = swipe.get("direction") or ""
+        dwell_ms        = swipe.get("dwell_ms")
+        expanded        = bool(swipe.get("expanded"))
+        sam_link_clicked = bool(swipe.get("sam_link_clicked"))
+        created_at      = swipe.get("created_at")
+        opp             = swipe.get("opportunities") or {}
 
-        dw = _dwell_weight(dwell_ms, direction, expanded)
+        dw = _dwell_weight(dwell_ms, direction, expanded, sam_link_clicked)
         td = _time_decay(created_at, swipes_ago=total - 1 - i)
         w  = dw * td
 
@@ -794,7 +809,7 @@ def compute_swipe_signals(sb, company_id: str) -> dict:
     # Fetch most recent 2000 swipes with opportunity data joined.
     # Ordered ASC so index == chronological position for decay calculation.
     result = sb.table("swipes").select(
-        "opportunity_id, direction, dwell_ms, expanded, created_at, "
+        "opportunity_id, direction, dwell_ms, expanded, sam_link_clicked, created_at, "
         "opportunities(naics_code, agency, value_max)"
     ).eq("company_id", company_id).in_(
         "direction", ["left", "right"]
@@ -843,7 +858,7 @@ def evaluate_scorer(sb, company_id: str, min_holdout: int = 20) -> dict | None:
     # three primary scoring signals. Title/description are absent, so keyword
     # scoring won't fire; that's acceptable since Stage 3 is a placeholder anyway.
     result = sb.table("swipes").select(
-        "opportunity_id, direction, dwell_ms, expanded, created_at, "
+        "opportunity_id, direction, dwell_ms, expanded, sam_link_clicked, created_at, "
         "opportunities(naics_code, agency, value_max, value_min, set_aside_type)"
     ).eq("company_id", company_id).in_(
         "direction", ["left", "right"]
