@@ -143,6 +143,18 @@ export const db = {
       .eq('opportunity_id', opportunityId)
   },
 
+  // Load full profile data for ProfileModal (bypasses Flask — direct Supabase reads)
+  getCompanyProfile: async (companyId) => {
+    const [naicsRes, keywordsRes] = await Promise.all([
+      supabase.from('company_naics').select('*').eq('company_id', companyId),
+      supabase.from('company_keywords').select('*').eq('company_id', companyId),
+    ])
+    return {
+      naics: naicsRes.data || [],
+      keywords: keywordsRes.data || [],
+    }
+  },
+
   // Save company profile
   saveCompany: async (companyId, data) => {
     return supabase.from('companies').update(data).eq('id', companyId)

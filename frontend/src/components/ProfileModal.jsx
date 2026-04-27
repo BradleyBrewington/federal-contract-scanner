@@ -24,15 +24,18 @@ export default function ProfileModal({ company, onClose }) {
   const [capsSaved, setCapsSaved] = useState(false)
 
   useEffect(() => {
-    api.getProfile().then(data => {
+    // Pre-fill from company prop immediately (no network needed)
+    setContractMin(company.contract_min != null ? String(company.contract_min) : '')
+    setContractMax(company.contract_max != null ? String(company.contract_max) : '')
+    setCapabilities(company.capabilities_statement || '')
+
+    // Fetch NAICS + keywords directly from Supabase (no Flask round trip)
+    db.getCompanyProfile(company.id).then(data => {
       setNaicsList(data.naics || [])
       setKeywords(data.keywords || [])
-      setContractMin(data.contract_min != null ? String(data.contract_min) : '')
-      setContractMax(data.contract_max != null ? String(data.contract_max) : '')
-      setCapabilities(data.capabilities_statement || '')
       setLoading(false)
     }).catch(() => setLoading(false))
-  }, [])
+  }, [company.id])
 
   // ── NAICS ──────────────────────────────────────────────────────────────────
 
