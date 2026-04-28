@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(curl:*)",
+      "Bash(ollama list:*)",
+      "WebSearch",
+      "WebFetch(domain:open.gsa.gov)",
+      "WebFetch(domain:api.sam.gov)",
+      "WebFetch(domain:govconapi.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.govcon.me)",
+      "Bash(pip install:*)"
+    ]
+  }
+}
