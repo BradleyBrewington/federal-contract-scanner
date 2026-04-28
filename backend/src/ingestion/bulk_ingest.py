@@ -566,7 +566,15 @@ def run_backfill_descriptions():
     no_description = 0  # 404 — SAM.gov has no description for this notice
     see_attachment = 0  # fetched but content just says "see attached" — attachment extraction needed
 
+    # Capture credentials so each worker thread can create its own Supabase client.
+    # Sharing a single client across threads causes WinError 10035 (WSAEWOULDBLOCK)
+    # as Windows socket pools get exhausted under concurrent use.
+    sb_url = os.getenv("SUPABASE_URL")
+    sb_key = os.getenv("SUPABASE_SERVICE_KEY")
+
     def _fetch_and_update(stub):
+        # Thread-local client — avoids shared socket pool contention
+        sb = create_client(sb_url, sb_key)
         text = fetch_description(stub["notice_id"], api_key)
         time.sleep(0.5)  # throttle regardless of result — respects ~1 req/s per worker
         if text is None:
@@ -578,7 +586,7 @@ def run_backfill_descriptions():
             # useless "see attached SOW" text. Leave as-is for Phase 3 (attachment extraction).
             return "see_attachment"
         try:
-            supabase.table("opportunities").update(
+            sb.table("opportunities").update(
                 {"description": text}
             ).eq("id", stub["id"]).execute()
             return "fetched"
