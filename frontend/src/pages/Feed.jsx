@@ -15,7 +15,8 @@ const QUEUE_MAX_AGE_MS = 4 * 60 * 60 * 1000
 const CARD_SCHEMA_VERSION = 6
 const SESSION_CARDS_KEY = `govscroll_cards_v${CARD_SCHEMA_VERSION}`
 
-const SAVE_ANIM_MS = 360  // Duration of the shrink-and-sink animation
+const SAVE_ANIM_MS     = 360  // Duration of the shrink-and-sink animation
+const KEYBOARD_SWIPE_MS = 500  // Duration of keyboard-triggered swipe slide animation
 
 function readSavedCards() {
   try {
@@ -42,8 +43,9 @@ export default function Feed({ user, company }) {
   )
   const [expandedCard, setExpandedCard] = useState(null)
   const [swipeHistory, setSwipeHistory] = useState([])
-  const [savingCardId, setSavingCardId] = useState(null)  // triggers shrink-and-sink anim
-  const [view, setView] = useState('feed')                // 'feed' | 'liked' | 'bookmarks'
+  const [savingCardId, setSavingCardId] = useState(null)        // triggers shrink-and-sink anim
+  const [keyboardSwipe, setKeyboardSwipe] = useState(null)     // { cardId, direction } | null
+  const [view, setView] = useState('feed')                     // 'feed' | 'liked' | 'bookmarks'
   const [savedCount, setSavedCount] = useState(0)
   const [bookmarkCount, setBookmarkCount] = useState(0)
 
@@ -183,16 +185,24 @@ export default function Feed({ user, company }) {
     }, SAVE_ANIM_MS)
   }, [user, company, cards.length, exhausted, loadFeed])
 
-  const swipe = useCallback(async (direction) => {
-    const ref = cardRefs.current[currentIndex]
-    if (!ref) return
-    // Show overlay + stamp first, then pause so they're visible before the card
-    // flies off. Without the delay the card is already gone before the 150ms
-    // opacity transition on the overlay has time to render.
+  // Keyboard swipe: bypass ref.swipe() entirely so we control the animation.
+  // ref.swipe() has no speed control and onSwipe (which unmounts the card) fires
+  // mid-animation — the card vanishes before the fly-off is visible.
+  // Instead: show hint instantly, CSS-animate the card off screen ourselves,
+  // then call onSwipe directly after the animation completes.
+  const swipe = useCallback((direction) => {
+    const card = cards[currentIndex]
+    if (!card) return
+    // Show overlay + stamp immediately (no waiting — the card starts moving right away)
     cardHintRefs.current[currentIndex]?.setHint(direction)
-    await new Promise(resolve => setTimeout(resolve, 300))
-    await ref.swipe(direction)
-  }, [currentIndex])
+    // Trigger our own CSS slide animation
+    setKeyboardSwipe({ cardId: card.id, direction })
+    // After animation, record + remove the card (same logic as onSwipe)
+    setTimeout(() => {
+      setKeyboardSwipe(null)
+      onSwipe(direction, card)
+    }, KEYBOARD_SWIPE_MS)
+  }, [cards, currentIndex, onSwipe])
 
   const handleUndo = useCallback(() => {
     if (swipeHistory.length === 0) return
@@ -312,7 +322,18 @@ export default function Feed({ user, company }) {
             {/* Card stack */}
             <div style={styles.deck}>
               {cards.map((card, index) => {
-                const isSaving = card.id === savingCardId
+                const isSaving   = card.id === savingCardId
+                const isKbSwipe  = keyboardSwipe?.cardId === card.id
+                const kbDir      = keyboardSwipe?.direction
+
+                // Keyboard swipe: slide the card off screen with a visible arc.
+                // We own this animation entirely — no react-tinder-card involvement.
+                const kbTransform = isKbSwipe
+                  ? kbDir === 'right'
+                    ? 'translateX(160%) rotate(20deg)'
+                    : 'translateX(-160%) rotate(-20deg)'
+                  : null
+
                 return (
                   <TinderCard
                     key={card.id}
@@ -338,16 +359,19 @@ export default function Feed({ user, company }) {
                       style={{
                         transform: isSaving
                           ? 'scale(0.78) translateY(72px)'
-                          : index === currentIndex
-                          ? 'scale(1)'
-                          : index === currentIndex - 1
-                          ? 'scale(0.96) translateY(12px)'
-                          : 'scale(0.92) translateY(24px)',
+                          : kbTransform
+                          ?? (index === currentIndex
+                            ? 'scale(1)'
+                            : index === currentIndex - 1
+                            ? 'scale(0.96) translateY(12px)'
+                            : 'scale(0.92) translateY(24px)'),
                         opacity: isSaving ? 0
                           : index < currentIndex - 2 ? 0 : 1,
-                        zIndex: isSaving ? 50 : index,
+                        zIndex: isKbSwipe ? 50 : isSaving ? 50 : index,
                         transition: isSaving
                           ? `transform ${SAVE_ANIM_MS}ms cubic-bezier(0.4, 0, 1, 1), opacity ${SAVE_ANIM_MS * 0.8}ms ease`
+                          : isKbSwipe
+                          ? `transform ${KEYBOARD_SWIPE_MS}ms cubic-bezier(0.4, 0, 0.2, 1)`
                           : 'transform 0.2s ease, opacity 0.2s ease',
                       }}
                     />
