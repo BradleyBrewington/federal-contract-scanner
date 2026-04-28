@@ -186,9 +186,11 @@ export default function Feed({ user, company }) {
   const swipe = useCallback(async (direction) => {
     const ref = cardRefs.current[currentIndex]
     if (!ref) return
-    // Show overlay + stamp before the card animates off — programmatic swipe
-    // doesn't fire onSwipeRequirementFulfilled so we have to drive it manually.
+    // Show overlay + stamp first, then pause so they're visible before the card
+    // flies off. Without the delay the card is already gone before the 150ms
+    // opacity transition on the overlay has time to render.
     cardHintRefs.current[currentIndex]?.setHint(direction)
+    await new Promise(resolve => setTimeout(resolve, 300))
     await ref.swipe(direction)
   }, [currentIndex])
 
