@@ -7,6 +7,8 @@ and historical pattern analysis.
 
 Run nightly after the delta load:
   python expiration.py
+
+Batches updates to avoid Supabase statement timeout on large result sets.
 """
 
 import os
@@ -27,8 +29,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+AGE_CUTOFF_DAYS = 365   # records with no deadline older than this are assumed closed
+UPDATE_BATCH    = 500   # IDs per UPDATE call — keeps each statement well under timeout
 
-AGE_CUTOFF_DAYS = 365  # records with no deadline older than this are assumed closed
+
+def _expire_batch(supabase, ids: list[str]) -> int:
+    """Update a list of opportunity IDs to expired. Returns count written."""
+    if not ids:
+        return 0
+    try:
+        result = (
+            supabase.table("opportunities")
+            .update({"status": "expired"})
+            .in_("id", ids)
+            .execute()
+        )
+        return len(result.data) if result.data else len(ids)
+    except Exception as e:
+        logger.error(f"Batch update failed: {e}")
+        return 0
+
+
+def _collect_ids(supabase, filters: dict) -> list[str]:
+    """
+    Page through opportunities matching `filters` and return their IDs.
+    Supabase SELECT is fast even on large tables; the slow part is the bulk UPDATE.
+    """
+    ids = []
+    offset = 0
+    page = 1000
+    while True:
+        q = supabase.table("opportunities").select("id").eq("status", "active")
+        for method, *args in filters:
+            q = getattr(q, method)(*args)
+        batch = q.range(offset, offset + page - 1).execute()
+        rows = batch.data or []
+        ids.extend(r["id"] for r in rows)
+        if len(rows) < page:
+            break
+        offset += page
+    return ids
 
 
 def run_expiration():
@@ -37,38 +77,41 @@ def run_expiration():
     supabase = create_client(url, key)
 
     now = datetime.now(timezone.utc)
-    now_iso = now.isoformat()
+    now_iso    = now.isoformat()
     cutoff_iso = (now - timedelta(days=AGE_CUTOFF_DAYS)).isoformat()
     logger.info(f"Running expiration check as of {now_iso} (age cutoff: {AGE_CUTOFF_DAYS} days)")
 
-    # Pass 1: deadline is set and has passed
-    result_deadline = (
-        supabase.table("opportunities")
-        .update({"status": "expired"})
-        .eq("status", "active")
-        .not_.is_("response_deadline", "null")
-        .lt("response_deadline", now_iso)
-        .execute()
-    )
-    count_deadline = len(result_deadline.data) if result_deadline.data else 0
-    logger.info(f"Marked {count_deadline} opportunities expired (deadline passed)")
+    total = 0
 
-    # Pass 2: no deadline but posted more than AGE_CUTOFF_DAYS ago.
-    # The vast majority of SAM.gov solicitations close within 180 days.
-    # 365 days is a conservative cutoff — we'd rather keep a stale record
-    # than prematurely expire a long-running IDIQ or open RFI.
-    result_age = (
-        supabase.table("opportunities")
-        .update({"status": "expired"})
-        .eq("status", "active")
-        .is_("response_deadline", "null")
-        .lt("posted_date", cutoff_iso)
-        .execute()
-    )
-    count_age = len(result_age.data) if result_age.data else 0
-    logger.info(f"Marked {count_age} opportunities expired (no deadline, posted > {AGE_CUTOFF_DAYS} days ago)")
+    # ── Pass 1: deadline is set and has passed ──────────────────────────────
+    logger.info("Pass 1: collecting records with passed deadline...")
+    ids_deadline = _collect_ids(supabase, [
+        ("not_.is_", "response_deadline", "null"),
+        ("lt",        "response_deadline", now_iso),
+    ])
+    logger.info(f"Pass 1: {len(ids_deadline):,} records to expire")
 
-    logger.info(f"Expiration complete: {count_deadline + count_age} total records marked expired")
+    for i in range(0, len(ids_deadline), UPDATE_BATCH):
+        chunk = ids_deadline[i : i + UPDATE_BATCH]
+        written = _expire_batch(supabase, chunk)
+        total += written
+        logger.info(f"Pass 1: expired {min(i + UPDATE_BATCH, len(ids_deadline)):,} / {len(ids_deadline):,}")
+
+    # ── Pass 2: no deadline, posted more than AGE_CUTOFF_DAYS ago ──────────
+    logger.info("Pass 2: collecting records with no deadline older than cutoff...")
+    ids_age = _collect_ids(supabase, [
+        ("is_",  "response_deadline", "null"),
+        ("lt",   "posted_date",       cutoff_iso),
+    ])
+    logger.info(f"Pass 2: {len(ids_age):,} records to expire")
+
+    for i in range(0, len(ids_age), UPDATE_BATCH):
+        chunk = ids_age[i : i + UPDATE_BATCH]
+        written = _expire_batch(supabase, chunk)
+        total += written
+        logger.info(f"Pass 2: expired {min(i + UPDATE_BATCH, len(ids_age)):,} / {len(ids_age):,}")
+
+    logger.info(f"Expiration complete: {total:,} total records marked expired")
 
 
 if __name__ == "__main__":
