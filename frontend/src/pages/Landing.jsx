@@ -345,7 +345,7 @@ function Footer({ mobile }) {
         <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
           <a href="/privacy" style={{ fontSize: '13px', color: 'var(--muted)', textDecoration: 'none' }}>Privacy Policy</a>
           <a href="/terms" style={{ fontSize: '13px', color: 'var(--muted)', textDecoration: 'none' }}>Terms of Service</a>
-          <a href="mailto:hello@icarusdynamicsllc.com" style={{ fontSize: '13px', color: 'var(--muted)', textDecoration: 'none' }}>hello@icarusdynamicsllc.com</a>
+          <a href="mailto:bradbrewington@icarusdynamicsllc.com" style={{ fontSize: '13px', color: 'var(--muted)', textDecoration: 'none' }}>bradbrewington@icarusdynamicsllc.com</a>
         </div>
       </div>
     </footer>
