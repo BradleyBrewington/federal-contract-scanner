@@ -45,6 +45,7 @@ BATCH_SIZE = 1000       # SAM.gov max per page
 UPSERT_BATCH = 250      # rows per Supabase upsert call
 DESC_WORKERS = 2        # parallel description fetches (keep low — SAM.gov rate limit ~1 req/s)
 DESC_MAX_CHARS = 50_000 # store up to 50k chars of description text
+DESC_DAILY_CAP = 9_000  # stop backfill at this many fetches/day; leaves headroom for delta + search API
 LAST_RUN_FILE = Path(__file__).resolve().parents[3] / "data" / "last_ingest.txt"
 
 
@@ -75,6 +76,31 @@ def _strip_html(text: str) -> str:
     # (keep \t \n \r which are valid in text columns)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     return text
+
+
+_SEE_ATTACHMENT_PHRASES = [
+    "see attach", "see the attach", "refer to attach",
+    "see sow", "see the sow", "see statement of work",
+    "see enclosed", "attached herein", "see solicitation",
+    "see rfp", "see rfi", "see rfq",
+    "please see", "refer to document", "see document",
+    "see associated file", "see below for", "see amendment",
+    "see pwd", "see performance work statement", "see pws",
+]
+
+
+def _is_see_attachment(text: str) -> bool:
+    """
+    Returns True if the fetched description is just a pointer to an attachment,
+    not substantive scope text. Descriptions this short with these phrases
+    contribute nothing to scoring or display — skip writing them to the DB.
+    Long descriptions (>600 chars) are assumed real even if they contain these
+    phrases incidentally.
+    """
+    if not text or len(text) > 600:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _SEE_ATTACHMENT_PHRASES)
 
 
 def fetch_description(notice_id: str, api_key: str) -> str | None:
@@ -472,20 +498,26 @@ def run_delta_load():
 
 def run_backfill_descriptions():
     """
-    One-time backfill: fetch real description text for all existing DB records
-    whose description field is still a SAM.gov API URL.
+    Resumable backfill: fetch real description text for active DB records whose
+    description field is still a SAM.gov API URL.
 
-    Run after initial ingestion:
+    Prioritization:
+      1. Active records only  — expired records are never shown in the feed
+      2. Most recently posted first — ensures feed-relevant records are enriched first
+      3. Hard daily cap (DESC_DAILY_CAP) — leaves quota headroom for delta + search API
+
+    Run daily until complete:
       py -3 backend/src/ingestion/bulk_ingest.py --backfill-descriptions
 
-    With DESC_WORKERS=10 and ~35k URL records, expect roughly 45–90 minutes.
-    Safe to interrupt and re-run — already-fixed records won't match the URL filter.
+    Safe to interrupt and re-run — already-enriched records no longer match the
+    URL filter and are automatically skipped.
     """
     logger.info("=== DESCRIPTION BACKFILL starting ===")
     supabase = get_supabase()
     api_key  = get_sam_api_key()
 
-    # Collect all records where description is still a SAM.gov URL
+    # Collect active records with URL descriptions, most recently posted first.
+    # Prioritizing active + recent means day-1 results immediately improve the feed.
     all_stubs = []
     offset = 0
     page_size = 1000
@@ -493,7 +525,9 @@ def run_backfill_descriptions():
         batch = (
             supabase.table("opportunities")
             .select("id, notice_id")
+            .eq("status", "active")
             .ilike("description", "http%")
+            .order("posted_date", desc=True)
             .range(offset, offset + page_size - 1)
             .execute()
         )
@@ -501,61 +535,84 @@ def run_backfill_descriptions():
         if not rows:
             break
         all_stubs.extend(rows)
-        logger.info(f"Found {len(all_stubs):,} URL-description records so far...")
+        logger.info(f"Found {len(all_stubs):,} active URL-description records so far...")
         if len(rows) < page_size:
             break
         offset += page_size
 
     if not all_stubs:
-        logger.info("No URL-description records found — backfill already complete.")
+        logger.info("No active URL-description records found — backfill complete.")
         return
 
-    logger.info(f"Backfilling descriptions for {len(all_stubs):,} records ({DESC_WORKERS} workers)...")
-    fetched = 0
-    failed  = 0
+    # Apply daily cap — run tomorrow for the remainder
+    capped = len(all_stubs) > DESC_DAILY_CAP
+    work_set = all_stubs[:DESC_DAILY_CAP]
+    logger.info(
+        f"{'Capping' if capped else 'Processing'} {len(work_set):,} of {len(all_stubs):,} records "
+        f"(daily cap: {DESC_DAILY_CAP:,}, workers: {DESC_WORKERS})"
+    )
+    if capped:
+        logger.info(f"Re-run tomorrow for the remaining {len(all_stubs) - DESC_DAILY_CAP:,} records.")
+
+    fetched        = 0
+    failed         = 0
+    see_attachment = 0  # fetched but content just says "see attached" — attachment extraction needed
 
     def _fetch_and_update(stub):
         text = fetch_description(stub["notice_id"], api_key)
-        time.sleep(0.5)  # throttle regardless of success/failure — ~1 req/s per worker
+        time.sleep(0.5)  # throttle regardless of result — respects ~1 req/s per worker
         if not text:
-            return False
+            return "failed"
+        if _is_see_attachment(text):
+            # Real content is in an attachment file — don't overwrite the URL with
+            # useless "see attached SOW" text. Leave as-is for Phase 3 (attachment extraction).
+            return "see_attachment"
         try:
             supabase.table("opportunities").update(
                 {"description": text}
             ).eq("id", stub["id"]).execute()
-            return True
+            return "fetched"
         except Exception as e:
             logger.warning(f"Update failed for {stub['notice_id']}: {e}")
-            return False
+            return "failed"
 
-    # Sanity check: verify the API works before processing 40k+ records
+    # Sanity-check the API before burning quota on 9k records
     logger.info("Sanity-checking noticedesc API with first record...")
-    test_stub = all_stubs[0]
-    test_text = fetch_description(test_stub["notice_id"], api_key)
+    test_text = fetch_description(work_set[0]["notice_id"], api_key)
     if test_text is None:
-        # Run with DEBUG logging to see the actual error
         logging.getLogger().setLevel(logging.DEBUG)
-        fetch_description(test_stub["notice_id"], api_key)
+        fetch_description(work_set[0]["notice_id"], api_key)
         logging.getLogger().setLevel(logging.INFO)
         logger.error(
-            f"API sanity check failed for notice_id={test_stub['notice_id']}. "
-            "Check the DEBUG output above. Possible causes: rate limit still active from "
-            "previous run (try again tomorrow), API key invalid, or wrong endpoint URL."
+            f"API sanity check FAILED for notice_id={work_set[0]['notice_id']}. "
+            "Check DEBUG output above. Likely causes: daily rate limit still active "
+            "(try again after midnight UTC), API key invalid, or endpoint URL changed."
         )
         return
-    logger.info(f"API check OK — got {len(test_text)} chars for first record. Starting full backfill...")
+    logger.info(f"API check OK — {len(test_text)} chars returned. Starting backfill...")
 
     with ThreadPoolExecutor(max_workers=DESC_WORKERS) as pool:
-        futures = [pool.submit(_fetch_and_update, stub) for stub in all_stubs]
+        futures = [pool.submit(_fetch_and_update, stub) for stub in work_set]
         for i, future in enumerate(as_completed(futures), 1):
-            if future.result():
+            result = future.result()
+            if result == "fetched":
                 fetched += 1
+            elif result == "see_attachment":
+                see_attachment += 1
             else:
                 failed += 1
             if i % 500 == 0:
-                logger.info(f"Progress: {i:,} / {len(all_stubs):,} ({fetched} fetched, {failed} failed)")
+                logger.info(
+                    f"Progress: {i:,} / {len(work_set):,} — "
+                    f"{fetched} fetched, {see_attachment} see-attachment, {failed} failed"
+                )
 
-    logger.info(f"=== DESCRIPTION BACKFILL complete: {fetched:,} fetched, {failed:,} failed ===")
+    logger.info(
+        f"=== DESCRIPTION BACKFILL complete: {fetched:,} fetched, "
+        f"{see_attachment:,} see-attachment (Phase 3), {failed:,} failed ==="
+    )
+    if capped:
+        logger.info(f"Run again tomorrow for remaining {len(all_stubs) - DESC_DAILY_CAP:,} records.")
 
 
 if __name__ == "__main__":
