@@ -106,19 +106,26 @@ def _is_see_attachment(text: str) -> bool:
 def fetch_description(notice_id: str, api_key: str) -> str | None:
     """
     Fetch the full description text for a SAM.gov notice.
-    Returns cleaned plain text, or None on failure.
+
+    Return values:
+      str  — cleaned description text (save to DB)
+      ""   — 404: SAM.gov has no description for this notice (skip, not an error)
+      None — real error: connection failure, 429 rate limit, etc. (abort sanity check)
     """
     if not notice_id:
-        return None
+        return ""
     try:
         resp = requests.get(
             SAM_DESC_BASE,
             params={"noticeid": notice_id, "api_key": api_key},
             timeout=15,
         )
+        if resp.status_code == 404:
+            # No description registered for this notice — normal for many records
+            return ""
         if resp.status_code != 200:
             logger.debug(f"fetch_description {notice_id}: HTTP {resp.status_code} — {resp.text[:200]}")
-            return None
+            return None  # real error
         data = resp.json()
         # SAM.gov noticedesc returns a list of description objects
         if isinstance(data, list):
@@ -127,8 +134,8 @@ def fetch_description(notice_id: str, api_key: str) -> str | None:
         else:
             raw = data.get("description") or data.get("body") or ""
         if not raw:
-            logger.debug(f"fetch_description {notice_id}: 200 OK but no description field. Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-            return None
+            logger.debug(f"fetch_description {notice_id}: 200 OK but empty body. Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            return ""
         return _strip_html(raw)[:DESC_MAX_CHARS]
     except Exception as e:
         logger.debug(f"fetch_description {notice_id}: exception — {e}")
@@ -556,13 +563,16 @@ def run_backfill_descriptions():
 
     fetched        = 0
     failed         = 0
+    no_description = 0  # 404 — SAM.gov has no description for this notice
     see_attachment = 0  # fetched but content just says "see attached" — attachment extraction needed
 
     def _fetch_and_update(stub):
         text = fetch_description(stub["notice_id"], api_key)
         time.sleep(0.5)  # throttle regardless of result — respects ~1 req/s per worker
-        if not text:
-            return "failed"
+        if text is None:
+            return "failed"         # real API error
+        if text == "":
+            return "no_description" # 404 — SAM.gov has nothing for this notice
         if _is_see_attachment(text):
             # Real content is in an attachment file — don't overwrite the URL with
             # useless "see attached SOW" text. Leave as-is for Phase 3 (attachment extraction).
@@ -576,20 +586,30 @@ def run_backfill_descriptions():
             logger.warning(f"Update failed for {stub['notice_id']}: {e}")
             return "failed"
 
-    # Sanity-check the API before burning quota on 9k records
-    logger.info("Sanity-checking noticedesc API with first record...")
-    test_text = fetch_description(work_set[0]["notice_id"], api_key)
-    if test_text is None:
+    # Sanity-check: try up to 5 records to confirm the API is reachable.
+    # A 404 ("") is fine — it means the API works, that notice just has no description.
+    # Only abort on None (connection error, 429, etc.).
+    logger.info("Sanity-checking noticedesc API...")
+    api_ok = False
+    for stub in work_set[:5]:
+        result = fetch_description(stub["notice_id"], api_key)
+        if result is None:
+            continue  # real error, try next record
+        api_ok = True
+        logger.info(f"API check OK (notice {stub['notice_id']}: {'no description' if result == '' else f'{len(result)} chars'})")
+        break
+
+    if not api_ok:
         logging.getLogger().setLevel(logging.DEBUG)
         fetch_description(work_set[0]["notice_id"], api_key)
         logging.getLogger().setLevel(logging.INFO)
         logger.error(
-            f"API sanity check FAILED for notice_id={work_set[0]['notice_id']}. "
-            "Check DEBUG output above. Likely causes: daily rate limit still active "
-            "(try again after midnight UTC), API key invalid, or endpoint URL changed."
+            "API sanity check FAILED on first 5 records. "
+            "Likely causes: daily rate limit still active (try again after midnight UTC), "
+            "API key invalid, or endpoint URL changed."
         )
         return
-    logger.info(f"API check OK — {len(test_text)} chars returned. Starting backfill...")
+    logger.info("Starting backfill...")
 
     with ThreadPoolExecutor(max_workers=DESC_WORKERS) as pool:
         futures = [pool.submit(_fetch_and_update, stub) for stub in work_set]
@@ -599,17 +619,21 @@ def run_backfill_descriptions():
                 fetched += 1
             elif result == "see_attachment":
                 see_attachment += 1
+            elif result == "no_description":
+                no_description += 1
             else:
                 failed += 1
             if i % 500 == 0:
                 logger.info(
                     f"Progress: {i:,} / {len(work_set):,} — "
-                    f"{fetched} fetched, {see_attachment} see-attachment, {failed} failed"
+                    f"{fetched} fetched, {see_attachment} see-attachment, "
+                    f"{no_description} no-description, {failed} failed"
                 )
 
     logger.info(
         f"=== DESCRIPTION BACKFILL complete: {fetched:,} fetched, "
-        f"{see_attachment:,} see-attachment (Phase 3), {failed:,} failed ==="
+        f"{see_attachment:,} see-attachment (Phase 3), "
+        f"{no_description:,} no-description (404), {failed:,} failed ==="
     )
     if capped:
         logger.info(f"Run again tomorrow for remaining {len(all_stubs) - DESC_DAILY_CAP:,} records.")
