@@ -185,7 +185,11 @@ export default function Feed({ user, company }) {
 
   const swipe = useCallback(async (direction) => {
     const ref = cardRefs.current[currentIndex]
-    if (ref) await ref.swipe(direction)
+    if (!ref) return
+    // Show overlay + stamp before the card animates off — programmatic swipe
+    // doesn't fire onSwipeRequirementFulfilled so we have to drive it manually.
+    cardHintRefs.current[currentIndex]?.setHint(direction)
+    await ref.swipe(direction)
   }, [currentIndex])
 
   const handleUndo = useCallback(() => {
