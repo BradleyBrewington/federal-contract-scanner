@@ -50,24 +50,47 @@ def _expire_batch(supabase, ids: list[str]) -> int:
         return 0
 
 
-def _collect_ids(supabase, filters: dict) -> list[str]:
-    """
-    Page through opportunities matching `filters` and return their IDs.
-    Supabase SELECT is fast even on large tables; the slow part is the bulk UPDATE.
-    """
+def _collect_deadline_ids(supabase, now_iso: str) -> list[str]:
+    """Collect IDs of active records whose response_deadline has passed."""
     ids = []
     offset = 0
-    page = 1000
     while True:
-        q = supabase.table("opportunities").select("id").eq("status", "active")
-        for method, *args in filters:
-            q = getattr(q, method)(*args)
-        batch = q.range(offset, offset + page - 1).execute()
+        batch = (
+            supabase.table("opportunities")
+            .select("id")
+            .eq("status", "active")
+            .not_.is_("response_deadline", "null")
+            .lt("response_deadline", now_iso)
+            .range(offset, offset + 999)
+            .execute()
+        )
         rows = batch.data or []
         ids.extend(r["id"] for r in rows)
-        if len(rows) < page:
+        if len(rows) < 1000:
             break
-        offset += page
+        offset += 1000
+    return ids
+
+
+def _collect_age_ids(supabase, cutoff_iso: str) -> list[str]:
+    """Collect IDs of active records with no deadline posted before the age cutoff."""
+    ids = []
+    offset = 0
+    while True:
+        batch = (
+            supabase.table("opportunities")
+            .select("id")
+            .eq("status", "active")
+            .is_("response_deadline", "null")
+            .lt("posted_date", cutoff_iso)
+            .range(offset, offset + 999)
+            .execute()
+        )
+        rows = batch.data or []
+        ids.extend(r["id"] for r in rows)
+        if len(rows) < 1000:
+            break
+        offset += 1000
     return ids
 
 
@@ -85,31 +108,21 @@ def run_expiration():
 
     # ── Pass 1: deadline is set and has passed ──────────────────────────────
     logger.info("Pass 1: collecting records with passed deadline...")
-    ids_deadline = _collect_ids(supabase, [
-        ("not_.is_", "response_deadline", "null"),
-        ("lt",        "response_deadline", now_iso),
-    ])
+    ids_deadline = _collect_deadline_ids(supabase, now_iso)
     logger.info(f"Pass 1: {len(ids_deadline):,} records to expire")
-
     for i in range(0, len(ids_deadline), UPDATE_BATCH):
         chunk = ids_deadline[i : i + UPDATE_BATCH]
-        written = _expire_batch(supabase, chunk)
-        total += written
-        logger.info(f"Pass 1: expired {min(i + UPDATE_BATCH, len(ids_deadline)):,} / {len(ids_deadline):,}")
+        total += _expire_batch(supabase, chunk)
+        logger.info(f"Pass 1: {min(i + UPDATE_BATCH, len(ids_deadline)):,} / {len(ids_deadline):,} expired")
 
     # ── Pass 2: no deadline, posted more than AGE_CUTOFF_DAYS ago ──────────
     logger.info("Pass 2: collecting records with no deadline older than cutoff...")
-    ids_age = _collect_ids(supabase, [
-        ("is_",  "response_deadline", "null"),
-        ("lt",   "posted_date",       cutoff_iso),
-    ])
+    ids_age = _collect_age_ids(supabase, cutoff_iso)
     logger.info(f"Pass 2: {len(ids_age):,} records to expire")
-
     for i in range(0, len(ids_age), UPDATE_BATCH):
         chunk = ids_age[i : i + UPDATE_BATCH]
-        written = _expire_batch(supabase, chunk)
-        total += written
-        logger.info(f"Pass 2: expired {min(i + UPDATE_BATCH, len(ids_age)):,} / {len(ids_age):,}")
+        total += _expire_batch(supabase, chunk)
+        logger.info(f"Pass 2: {min(i + UPDATE_BATCH, len(ids_age)):,} / {len(ids_age):,} expired")
 
     logger.info(f"Expiration complete: {total:,} total records marked expired")
 
