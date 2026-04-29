@@ -678,10 +678,21 @@ def run_backfill_descriptions():
     for stub in work_set[:SANITY_CHECK_N]:
         text, status = fetch_description(stub["notice_id"], api_key)
         sanity_done += 1
-        quota_used_today += 1
+        quota_counter[0] += 1
         if text is None:
             sanity_none += 1
             logger.debug(f"  Sanity FAIL: {stub['notice_id']} → HTTP {status}")
+            # 429 that survived a 30s retry means the daily quota is exhausted.
+            # Every subsequent check will also 429 — fast-fail immediately rather
+            # than spending 20 × 60s probing a wall.
+            if status == 429:
+                logger.error(
+                    "429 confirmed after retry — daily API quota is exhausted. "
+                    "Re-run after midnight Eastern Time. Aborting."
+                )
+                quota_file.write_text(json.dumps({"used": quota_counter[0], "date": run_date}))
+                logger.removeHandler(file_handler)
+                return
         else:
             label = "no desc" if text == "" else f"{len(text):,} chars"
             logger.info(f"  Sanity OK:   {stub['notice_id']} → HTTP {status} ({label})")
@@ -693,7 +704,7 @@ def run_backfill_descriptions():
             f"Likely causes: daily quota active (try after midnight UTC), API key invalid, "
             f"or endpoint URL changed. Aborting."
         )
-        quota_file.write_text(json.dumps({"used": quota_used_today, "date": run_date}))
+        quota_file.write_text(json.dumps({"used": quota_counter[0], "date": run_date}))
         logger.removeHandler(file_handler)
         return
     logger.info(f"Sanity check passed ({fail_rate:.0%} failure rate). Starting main run...")
