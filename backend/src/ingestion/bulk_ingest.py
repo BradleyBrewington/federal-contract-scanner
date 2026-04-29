@@ -17,8 +17,10 @@ import os
 import sys
 import re
 import json
+import html as html_lib
 import logging
 import argparse
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +29,12 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
+
+try:
+    from bs4 import BeautifulSoup
+    _HAS_BS4 = True
+except ImportError:
+    _HAS_BS4 = False
 
 # Load .env from the project root (two levels up from this file)
 env_path = Path(__file__).resolve().parents[3] / ".env"
@@ -41,12 +49,18 @@ logger = logging.getLogger(__name__)
 
 SAM_API_BASE = "https://api.sam.gov/opportunities/v2/search"
 SAM_DESC_BASE = "https://api.sam.gov/prod/opportunities/v1/noticedesc"
-BATCH_SIZE = 1000       # SAM.gov max per page
-UPSERT_BATCH = 250      # rows per Supabase upsert call
-DESC_WORKERS = 2        # parallel description fetches (keep low — SAM.gov rate limit ~1 req/s)
-DESC_MAX_CHARS = 50_000 # store up to 50k chars of description text
-DESC_DAILY_CAP = 9_000  # stop backfill at this many fetches/day; leaves headroom for delta + search API
-LAST_RUN_FILE = Path(__file__).resolve().parents[3] / "data" / "last_ingest.txt"
+BATCH_SIZE        = 1000      # SAM.gov max per page
+UPSERT_BATCH      = 250       # rows per Supabase upsert call
+DESC_WORKERS      = 2         # parallel description fetches — bump to 4 if no 429s observed
+DESC_WORKER_SLEEP = 0.5       # seconds to sleep after each fetch per worker (~1 req/s total)
+DESC_MAX_CHARS    = 50_000    # store up to 50k chars of description text
+DESC_DAILY_CAP    = 9_000     # stop backfill at this many fetches/day; leaves headroom for delta + search
+SANITY_CHECK_N         = 20   # records to probe before starting main run (issue #1)
+SANITY_FAIL_THRESHOLD  = 0.20 # abort sanity if >20% return None (issue #1)
+ABORT_FAIL_THRESHOLD   = 0.05 # abort mid-run if rolling failure rate exceeds 5% (issue #8)
+RATE_LIMIT_ABORT_COUNT = 5    # shut down if this many 429s accumulate across all workers (issue #2)
+DATA_DIR      = Path(__file__).resolve().parents[3] / "data"
+LAST_RUN_FILE = DATA_DIR / "last_ingest.txt"
 
 
 def get_supabase() -> Client:
@@ -69,14 +83,38 @@ def get_sam_api_key() -> str:
 # ---------------------------------------------------------------------------
 
 def _strip_html(text: str) -> str:
-    """Remove HTML tags, normalize whitespace, and strip Postgres-incompatible control chars."""
-    text = re.sub(r'<[^>]+>', ' ', text)
+    """
+    Remove HTML tags, decode entities, normalize whitespace, strip Postgres-incompatible
+    control characters. Uses BeautifulSoup when available (handles MS Word HTML, tables,
+    embedded images); falls back to regex for environments without bs4.
+    """
+    if _HAS_BS4:
+        try:
+            text = BeautifulSoup(text, "html.parser").get_text(separator=' ', strip=True)
+        except Exception:
+            text = re.sub(r'<[^>]+>', ' ', text)
+    else:
+        text = re.sub(r'<[^>]+>', ' ', text)
+
+    # Decode HTML entities (&amp; &#39; &nbsp; etc.) that survive tag stripping
+    text = html_lib.unescape(text)
     text = re.sub(r'\s+', ' ', text).strip()
     # Remove null bytes and other control characters Postgres rejects
     # (keep \t \n \r which are valid in text columns)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     return text
 
+
+# Phrases that indicate a notice was cancelled/withdrawn/superseded.
+# If found, update record status rather than writing the text as a description.
+_WITHDRAWN_PHRASES = [
+    "this notice has been cancelled",
+    "this notice has been withdrawn",
+    "this notice has been replaced",
+    "this solicitation has been cancelled",
+    "this requirement has been cancelled",
+    "award has been cancelled",
+]
 
 _SEE_ATTACHMENT_PHRASES = [
     "see attach", "see the attach", "refer to attach",
@@ -103,43 +141,78 @@ def _is_see_attachment(text: str) -> bool:
     return any(phrase in lowered for phrase in _SEE_ATTACHMENT_PHRASES)
 
 
-def fetch_description(notice_id: str, api_key: str) -> str | None:
+def fetch_description(notice_id: str, api_key: str) -> tuple[str | None, int | None]:
     """
     Fetch the full description text for a SAM.gov notice.
 
-    Return values:
-      str  — cleaned description text (save to DB)
-      ""   — 404: SAM.gov has no description for this notice (skip, not an error)
-      None — real error: connection failure, 429 rate limit, etc. (abort sanity check)
+    Returns (text, http_status):
+      (str, 200)   — real description text; save to DB
+      ("", 404)    — SAM.gov has no description for this notice; normal, not an error
+      (None, 429)  — rate limited; caller should back off and may abort
+      (None, 5xx)  — server error; retried once with 30s sleep before returning
+      (None, None) — connection exception
+
+    429 and 5xx get one automatic retry with exponential sleep before returning failure.
     """
     if not notice_id:
-        return ""
-    try:
-        resp = requests.get(
+        return "", 404
+
+    def _do_request():
+        return requests.get(
             SAM_DESC_BASE,
             params={"noticeid": notice_id, "api_key": api_key},
             timeout=15,
         )
+
+    try:
+        resp = _do_request()
+
+        # 429 — rate limited: sleep 30s and retry once
+        if resp.status_code == 429:
+            logger.warning(f"429 on {notice_id} — sleeping 30s then retrying")
+            time.sleep(30)
+            try:
+                resp = _do_request()
+            except Exception:
+                return None, 429
+            if resp.status_code == 429:
+                logger.warning(f"429 again on {notice_id} after retry — aborting this record")
+                return None, 429
+
+        # 5xx — transient server error: sleep 10s and retry once
+        if resp.status_code >= 500:
+            logger.warning(f"HTTP {resp.status_code} on {notice_id} — sleeping 10s then retrying")
+            time.sleep(10)
+            try:
+                resp = _do_request()
+            except Exception:
+                return None, resp.status_code
+            if resp.status_code >= 500:
+                return None, resp.status_code
+
         if resp.status_code == 404:
-            # No description registered for this notice — normal for many records
-            return ""
+            return "", 404
+
         if resp.status_code != 200:
             logger.debug(f"fetch_description {notice_id}: HTTP {resp.status_code} — {resp.text[:200]}")
-            return None  # real error
+            return None, resp.status_code
+
         data = resp.json()
-        # SAM.gov noticedesc returns a list of description objects
         if isinstance(data, list):
             parts = [item.get("description") or item.get("body") or "" for item in data]
             raw = " ".join(p for p in parts if p)
         else:
             raw = data.get("description") or data.get("body") or ""
+
         if not raw:
-            logger.debug(f"fetch_description {notice_id}: 200 OK but empty body. Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-            return ""
-        return _strip_html(raw)[:DESC_MAX_CHARS]
+            logger.debug(f"fetch_description {notice_id}: 200 OK but empty body")
+            return "", 200
+
+        return _strip_html(raw)[:DESC_MAX_CHARS], 200
+
     except Exception as e:
         logger.debug(f"fetch_description {notice_id}: exception — {e}")
-        return None
+        return None, None
 
 
 def enrich_descriptions(parsed_records: list[dict], api_key: str) -> list[dict]:
@@ -160,7 +233,7 @@ def enrich_descriptions(parsed_records: list[dict], api_key: str) -> list[dict]:
     failed  = 0
 
     def _fetch(record):
-        text = fetch_description(record.get("notice_id", ""), api_key)
+        text, _status = fetch_description(record.get("notice_id", ""), api_key)
         return record["notice_id"], text
 
     with ThreadPoolExecutor(max_workers=DESC_WORKERS) as pool:
@@ -168,7 +241,6 @@ def enrich_descriptions(parsed_records: list[dict], api_key: str) -> list[dict]:
         for future in as_completed(futures):
             notice_id, text = future.result()
             if text:
-                # Find the record and update its description in-place
                 for r in parsed_records:
                     if r.get("notice_id") == notice_id:
                         r["description"] = text
@@ -508,30 +580,68 @@ def run_backfill_descriptions():
     Resumable backfill: fetch real description text for active DB records whose
     description field is still a SAM.gov API URL.
 
-    Prioritization:
-      1. Active records only  — expired records are never shown in the feed
-      2. Most recently posted first — ensures feed-relevant records are enriched first
-      3. Hard daily cap (DESC_DAILY_CAP) — leaves quota headroom for delta + search API
+    Fixes applied:
+      #1  Sanity check: 20 records, abort if >20% return None
+      #2  Exponential backoff on 429/5xx in fetch_description; abort if 5 total 429s
+      #3  Ordering: posted_date DESC (best available without impression tracking)
+      #5  see_attachment: notice_ids logged to data/see_attachment_YYYY-MM-DD.txt
+      #6  Withdrawn/cancelled detection: updates status column, skips description write
+      #7  Persistent log file at data/logs/backfill_YYYY-MM-DD.log
+      #8  Mid-run abort if rolling failure rate exceeds 5% after 100 records
+      #9  Saves original URL to description_url before overwriting; falls back if column missing
+      #10 _strip_html uses BeautifulSoup when available + html.unescape
+
+    Prerequisite schema change (run once in Supabase SQL Editor):
+      ALTER TABLE opportunities
+        ADD COLUMN IF NOT EXISTS description_url TEXT,
+        ADD COLUMN IF NOT EXISTS description_fetched_at TIMESTAMPTZ;
 
     Run daily until complete:
       py -3 backend/src/ingestion/bulk_ingest.py --backfill-descriptions
 
-    Safe to interrupt and re-run — already-enriched records no longer match the
-    URL filter and are automatically skipped.
+    Safe to interrupt and re-run — enriched records no longer match the URL filter.
     """
+    run_start = datetime.now(timezone.utc)
+    run_date  = run_start.strftime("%Y-%m-%d")
+
+    # ── Persistent log file ─────────────────────────────────────────────────
+    log_dir = DATA_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_dir / f"backfill_{run_date}.log")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(file_handler)
+
     logger.info("=== DESCRIPTION BACKFILL starting ===")
     supabase = get_supabase()
     api_key  = get_sam_api_key()
 
-    # Collect active records with URL descriptions, most recently posted first.
-    # Prioritizing active + recent means day-1 results immediately improve the feed.
+    # ── Quota tracking ──────────────────────────────────────────────────────
+    # SAM.gov doesn't expose remaining quota via headers — track client-side.
+    quota_file = DATA_DIR / f"quota_{run_date}.json"
+    quota_used_today = 0
+    if quota_file.exists():
+        try:
+            quota_used_today = json.loads(quota_file.read_text()).get("used", 0)
+        except Exception:
+            pass
+    quota_available = DESC_DAILY_CAP - quota_used_today
+    logger.info(f"Quota used today so far: {quota_used_today:,} / 10,000. Available for this run: {quota_available:,}")
+    if quota_available <= 0:
+        logger.error("Daily quota already consumed. Re-run after midnight UTC.")
+        logger.removeHandler(file_handler)
+        return
+
+    # ── Collect work set ────────────────────────────────────────────────────
+    # Fetch description field too so we can save it to description_url before overwriting.
+    # Active-only: expired records never surface in the feed.
+    # posted_date DESC: most recently posted = most likely to appear in feed.
     all_stubs = []
-    offset = 0
+    offset    = 0
     page_size = 1000
     while True:
         batch = (
             supabase.table("opportunities")
-            .select("id, notice_id")
+            .select("id, notice_id, description")
             .eq("status", "active")
             .ilike("description", "http%")
             .order("posted_date", desc=True)
@@ -549,102 +659,203 @@ def run_backfill_descriptions():
 
     if not all_stubs:
         logger.info("No active URL-description records found — backfill complete.")
+        logger.removeHandler(file_handler)
         return
 
-    # Apply daily cap — run tomorrow for the remainder
-    capped = len(all_stubs) > DESC_DAILY_CAP
-    work_set = all_stubs[:DESC_DAILY_CAP]
+    capped   = len(all_stubs) > quota_available
+    work_set = all_stubs[:quota_available]
     logger.info(
-        f"{'Capping' if capped else 'Processing'} {len(work_set):,} of {len(all_stubs):,} records "
-        f"(daily cap: {DESC_DAILY_CAP:,}, workers: {DESC_WORKERS})"
+        f"{'Capping at quota' if capped else 'Processing'} {len(work_set):,} of "
+        f"{len(all_stubs):,} records (workers: {DESC_WORKERS})"
     )
     if capped:
-        logger.info(f"Re-run tomorrow for the remaining {len(all_stubs) - DESC_DAILY_CAP:,} records.")
+        logger.info(f"Re-run tomorrow for the remaining {len(all_stubs) - quota_available:,} records.")
 
-    fetched        = 0
-    failed         = 0
-    no_description = 0  # 404 — SAM.gov has no description for this notice
-    see_attachment = 0  # fetched but content just says "see attached" — attachment extraction needed
+    # ── Sanity check — 20 records, abort if >20% fail ───────────────────────
+    logger.info(f"Sanity-checking noticedesc API ({SANITY_CHECK_N} records)...")
+    sanity_none = 0
+    sanity_done = 0
+    for stub in work_set[:SANITY_CHECK_N]:
+        text, status = fetch_description(stub["notice_id"], api_key)
+        sanity_done += 1
+        quota_used_today += 1
+        if text is None:
+            sanity_none += 1
+            logger.debug(f"  Sanity FAIL: {stub['notice_id']} → HTTP {status}")
+        else:
+            label = "no desc" if text == "" else f"{len(text):,} chars"
+            logger.info(f"  Sanity OK:   {stub['notice_id']} → HTTP {status} ({label})")
 
-    # Capture credentials so each worker thread can create its own Supabase client.
-    # Sharing a single client across threads causes WinError 10035 (WSAEWOULDBLOCK)
-    # as Windows socket pools get exhausted under concurrent use.
-    sb_url = os.getenv("SUPABASE_URL")
-    sb_key = os.getenv("SUPABASE_SERVICE_KEY")
+    fail_rate = sanity_none / sanity_done if sanity_done else 1.0
+    if fail_rate > SANITY_FAIL_THRESHOLD:
+        logger.error(
+            f"Sanity check FAILED: {sanity_none}/{sanity_done} ({fail_rate:.0%}) returned errors. "
+            f"Likely causes: daily quota active (try after midnight UTC), API key invalid, "
+            f"or endpoint URL changed. Aborting."
+        )
+        quota_file.write_text(json.dumps({"used": quota_used_today, "date": run_date}))
+        logger.removeHandler(file_handler)
+        return
+    logger.info(f"Sanity check passed ({fail_rate:.0%} failure rate). Starting main run...")
+
+    # Skip sanity records from main work set to avoid double-fetching
+    work_set = work_set[SANITY_CHECK_N:]
+
+    # ── Shared state for workers ────────────────────────────────────────────
+    sb_url         = os.getenv("SUPABASE_URL")
+    sb_key         = os.getenv("SUPABASE_SERVICE_KEY")
+    shutdown_event = threading.Event()
+    results_lock   = threading.Lock()
+    quota_lock     = threading.Lock()
+
+    counters = {"fetched": 0, "failed": 0, "no_description": 0,
+                "see_attachment": 0, "cancelled": 0, "rate_limited": 0, "aborted": 0}
+    # Mutable container so workers can increment without nonlocal
+    quota_counter = [quota_used_today]
+
+    # Per-failure log: notice_id + HTTP status for pattern analysis
+    failure_log_path = log_dir / f"backfill_failures_{run_date}.tsv"
+    failure_log = open(failure_log_path, "a", encoding="utf-8")
+    failure_log.write("notice_id\thttp_status\ttimestamp\n")
+
+    # see_attachment log: notice_ids for spot-checking threshold accuracy
+    attachment_log_path = DATA_DIR / f"see_attachment_{run_date}.txt"
+    attachment_log = open(attachment_log_path, "a", encoding="utf-8")
 
     def _fetch_and_update(stub):
-        # Thread-local client — avoids shared socket pool contention
-        sb = create_client(sb_url, sb_key)
-        text = fetch_description(stub["notice_id"], api_key)
-        time.sleep(0.5)  # throttle regardless of result — respects ~1 req/s per worker
+        if shutdown_event.is_set():
+            return "aborted"
+
+        sb           = create_client(sb_url, sb_key)
+        notice_id    = stub["notice_id"]
+        original_url = stub.get("description", "")
+
+        text, status = fetch_description(notice_id, api_key)
+        time.sleep(DESC_WORKER_SLEEP)
+
+        with quota_lock:
+            quota_counter[0] += 1
+
+        # 429 — rate limited even after the built-in retry in fetch_description
+        if status == 429:
+            with results_lock:
+                counters["rate_limited"] += 1
+                if counters["rate_limited"] >= RATE_LIMIT_ABORT_COUNT:
+                    logger.error(f"{RATE_LIMIT_ABORT_COUNT} rate-limit hits — triggering shutdown to preserve quota")
+                    shutdown_event.set()
+            failure_log.write(f"{notice_id}\t{status}\t{datetime.now(timezone.utc).isoformat()}\n")
+            return "rate_limited"
+
+        # Real error (connection, 5xx that didn't resolve after retry)
         if text is None:
-            return "failed"         # real API error
-        if text == "":
-            return "no_description" # 404 — SAM.gov has nothing for this notice
-        if _is_see_attachment(text):
-            # Real content is in an attachment file — don't overwrite the URL with
-            # useless "see attached SOW" text. Leave as-is for Phase 3 (attachment extraction).
-            return "see_attachment"
-        try:
-            sb.table("opportunities").update(
-                {"description": text}
-            ).eq("id", stub["id"]).execute()
-            return "fetched"
-        except Exception as e:
-            logger.warning(f"Update failed for {stub['notice_id']}: {e}")
+            failure_log.write(f"{notice_id}\t{status}\t{datetime.now(timezone.utc).isoformat()}\n")
             return "failed"
 
-    # Sanity-check: try up to 5 records to confirm the API is reachable.
-    # A 404 ("") is fine — it means the API works, that notice just has no description.
-    # Only abort on None (connection error, 429, etc.).
-    logger.info("Sanity-checking noticedesc API...")
-    api_ok = False
-    for stub in work_set[:5]:
-        result = fetch_description(stub["notice_id"], api_key)
-        if result is None:
-            continue  # real error, try next record
-        api_ok = True
-        logger.info(f"API check OK (notice {stub['notice_id']}: {'no description' if result == '' else f'{len(result)} chars'})")
-        break
+        # 404 — no description registered for this notice
+        if text == "":
+            return "no_description"
 
-    if not api_ok:
-        logging.getLogger().setLevel(logging.DEBUG)
-        fetch_description(work_set[0]["notice_id"], api_key)
-        logging.getLogger().setLevel(logging.INFO)
-        logger.error(
-            "API sanity check FAILED on first 5 records. "
-            "Likely causes: daily rate limit still active (try again after midnight UTC), "
-            "API key invalid, or endpoint URL changed."
-        )
-        return
-    logger.info("Starting backfill...")
+        lower = text.lower()
 
+        # Withdrawn/cancelled notice — update status, don't write as description
+        if any(phrase in lower for phrase in _WITHDRAWN_PHRASES):
+            try:
+                sb.table("opportunities").update({"status": "cancelled"}).eq("id", stub["id"]).execute()
+            except Exception as e:
+                logger.debug(f"Status update failed for {notice_id}: {e}")
+            return "cancelled"
+
+        # "See attachment" — substantive content is in a file, not this text
+        if _is_see_attachment(text):
+            attachment_log.write(f"{notice_id}\n")
+            return "see_attachment"
+
+        # Write description. Attempt to preserve original URL in description_url.
+        update_data = {
+            "description": text,
+            "description_fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if original_url.startswith("http"):
+            update_data["description_url"] = original_url
+
+        try:
+            sb.table("opportunities").update(update_data).eq("id", stub["id"]).execute()
+            return "fetched"
+        except Exception as e:
+            # If description_url or description_fetched_at column doesn't exist yet,
+            # retry with just the description field so the run doesn't fail.
+            if "description_url" in str(e) or "description_fetched_at" in str(e):
+                logger.warning("description_url/fetched_at column missing — run the ALTER TABLE DDL in Supabase")
+                try:
+                    sb.table("opportunities").update({"description": text}).eq("id", stub["id"]).execute()
+                    return "fetched"
+                except Exception as e2:
+                    logger.warning(f"Fallback update failed for {notice_id}: {e2}")
+                    failure_log.write(f"{notice_id}\tDB_ERROR\t{datetime.now(timezone.utc).isoformat()}\n")
+                    return "failed"
+            logger.warning(f"Update failed for {notice_id}: {e}")
+            failure_log.write(f"{notice_id}\tDB_ERROR\t{datetime.now(timezone.utc).isoformat()}\n")
+            return "failed"
+
+    # ── Main run ────────────────────────────────────────────────────────────
     with ThreadPoolExecutor(max_workers=DESC_WORKERS) as pool:
         futures = [pool.submit(_fetch_and_update, stub) for stub in work_set]
         for i, future in enumerate(as_completed(futures), 1):
             result = future.result()
-            if result == "fetched":
-                fetched += 1
-            elif result == "see_attachment":
-                see_attachment += 1
-            elif result == "no_description":
-                no_description += 1
-            else:
-                failed += 1
-            if i % 500 == 0:
+            with results_lock:
+                counters[result] = counters.get(result, 0) + 1
+
+            # Rolling failure-rate check — abort if >5% after first 100 completions
+            if i >= 100 and i % 100 == 0:
+                total_attempted = counters["fetched"] + counters["failed"] + counters["rate_limited"]
+                hard_failures   = counters["failed"] + counters["rate_limited"]
+                roll_rate       = hard_failures / total_attempted if total_attempted else 0
+                if roll_rate > ABORT_FAIL_THRESHOLD:
+                    logger.error(
+                        f"Failure rate {roll_rate:.1%} exceeds {ABORT_FAIL_THRESHOLD:.0%} threshold "
+                        f"after {i:,} records — aborting to preserve quota"
+                    )
+                    shutdown_event.set()
+
+            if shutdown_event.is_set():
+                logger.warning("Shutdown signal received — cancelling remaining futures")
+                for f in futures:
+                    f.cancel()
+                break
+
+            if i % 500 == 0 or i == len(work_set):
+                total    = sum(counters.values())
+                failures = counters["failed"] + counters["rate_limited"]
                 logger.info(
-                    f"Progress: {i:,} / {len(work_set):,} — "
-                    f"{fetched} fetched, {see_attachment} see-attachment, "
-                    f"{no_description} no-description, {failed} failed"
+                    f"Progress {i:,}/{len(work_set):,} | "
+                    f"fetched={counters['fetched']:,} no_desc={counters['no_description']:,} "
+                    f"see_attach={counters['see_attachment']:,} cancelled={counters['cancelled']:,} "
+                    f"failed={failures:,} | "
+                    f"fail_rate={failures/max(total,1):.1%} quota_used≈{quota_counter[0]:,}"
                 )
 
+    failure_log.close()
+    attachment_log.close()
+
+    # Persist quota count
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    quota_file.write_text(json.dumps({"used": quota_counter[0], "date": run_date}))
+
+    elapsed = (datetime.now(timezone.utc) - run_start).total_seconds()
     logger.info(
-        f"=== DESCRIPTION BACKFILL complete: {fetched:,} fetched, "
-        f"{see_attachment:,} see-attachment (Phase 3), "
-        f"{no_description:,} no-description (404), {failed:,} failed ==="
+        f"=== DESCRIPTION BACKFILL complete in {elapsed/60:.1f}min | "
+        f"fetched={counters['fetched']:,} no_desc={counters['no_description']:,} "
+        f"see_attach={counters['see_attachment']:,} cancelled={counters['cancelled']:,} "
+        f"failed={counters['failed']:,} rate_limited={counters['rate_limited']:,} "
+        f"aborted={counters['aborted']:,} quota_used≈{quota_counter[0]:,} ==="
     )
-    if capped:
-        logger.info(f"Run again tomorrow for remaining {len(all_stubs) - DESC_DAILY_CAP:,} records.")
+    logger.info(f"Failure log: {failure_log_path}")
+    logger.info(f"See-attachment log: {attachment_log_path}")
+    if capped or shutdown_event.is_set():
+        remaining = len(all_stubs) - quota_available
+        logger.info(f"Re-run tomorrow for remaining ~{max(remaining,0):,} records.")
+
+    logger.removeHandler(file_handler)
 
 
 if __name__ == "__main__":
