@@ -15,8 +15,7 @@ const QUEUE_MAX_AGE_MS = 4 * 60 * 60 * 1000
 const CARD_SCHEMA_VERSION = 6
 const SESSION_CARDS_KEY = `govscroll_cards_v${CARD_SCHEMA_VERSION}`
 
-const SAVE_ANIM_MS     = 360  // Duration of the shrink-and-sink animation
-const KEYBOARD_SWIPE_MS = 500  // Duration of keyboard-triggered swipe slide animation
+const SAVE_ANIM_MS = 360  // Duration of the shrink-and-sink animation
 
 function readSavedCards() {
   try {
@@ -43,17 +42,18 @@ export default function Feed({ user, company }) {
   )
   const [expandedCard, setExpandedCard] = useState(null)
   const [swipeHistory, setSwipeHistory] = useState([])
-  const [savingCardId, setSavingCardId] = useState(null)        // triggers shrink-and-sink anim
-  const [keyboardSwipe, setKeyboardSwipe] = useState(null)     // { cardId, direction } | null
-  const [view, setView] = useState('feed')                     // 'feed' | 'liked' | 'bookmarks'
+  const [savingCardId, setSavingCardId] = useState(null)  // triggers shrink-and-sink anim
+  const [view, setView] = useState('feed')                // 'feed' | 'liked' | 'bookmarks'
   const [savedCount, setSavedCount] = useState(0)
   const [bookmarkCount, setBookmarkCount] = useState(0)
 
-  const cardRefs       = useRef([])        // TinderCard refs (for programmatic swipe)
-  const cardHintRefs   = useRef([])        // OpportunityCard refs (for imperative setHint)
-  const swipeStartTime = useRef(null)
+  const cardRefs          = useRef([])        // TinderCard refs (for programmatic swipe)
+  const cardHintRefs      = useRef([])        // OpportunityCard refs (for imperative setHint)
+  const swipeStartTime    = useRef(null)
   const expandedCardIds   = useRef(new Set())  // cards where user opened the detail modal
   const samClickedCardIds = useRef(new Set())  // cards where user clicked the SAM.gov link
+  const swipingRef        = useRef(false)      // prevents double-swipe from key repeat
+  const kbSwipingCardId   = useRef(null)       // id of card being keyboard-swiped; onSwipe defers its unmount
 
   const currentIndex = cards.length - 1
 
@@ -128,7 +128,16 @@ export default function Feed({ user, company }) {
 
     setSwipeCount(prev => prev + 1)
     setSwipeHistory(prev => [...prev.slice(-(SWIPE_HISTORY_MAX - 1)), { card, direction }])
-    setCards(prev => prev.filter(c => c.id !== card.id))
+
+    // For keyboard swipes, onSwipe fires at the START of the fly-off animation (not the end).
+    // Removing the card immediately unmounts it mid-flight. Defer 350ms so the animation
+    // completes visually before the element disappears from the DOM.
+    const removeFromDeck = () => setCards(prev => prev.filter(c => c.id !== card.id))
+    if (kbSwipingCardId.current === card.id) {
+      setTimeout(removeFromDeck, 350)
+    } else {
+      removeFromDeck()
+    }
 
     if (cards.length - 1 <= 6 && !exhausted) loadFeed()
 
@@ -185,24 +194,29 @@ export default function Feed({ user, company }) {
     }, SAVE_ANIM_MS)
   }, [user, company, cards.length, exhausted, loadFeed])
 
-  // Keyboard swipe: bypass ref.swipe() entirely so we control the animation.
-  // ref.swipe() has no speed control and onSwipe (which unmounts the card) fires
-  // mid-animation — the card vanishes before the fly-off is visible.
-  // Instead: show hint instantly, CSS-animate the card off screen ourselves,
-  // then call onSwipe directly after the animation completes.
   const swipe = useCallback((direction) => {
-    const card = cards[currentIndex]
-    if (!card) return
-    // Show overlay + stamp immediately (no waiting — the card starts moving right away)
+    // Guard: ignore key repeat or rapid multi-press while a swipe is in flight
+    if (swipingRef.current) return
+    const ref = cardRefs.current[currentIndex]
+    if (!ref) return
+
+    swipingRef.current = true
+    kbSwipingCardId.current = cards[currentIndex]?.id ?? null
+
+    // Show hint, then yield one frame so the overlay paints before the card moves.
+    // Without the rAF, hint and swipe arrive in the same paint frame and the
+    // overlay is never visible.
     cardHintRefs.current[currentIndex]?.setHint(direction)
-    // Trigger our own CSS slide animation
-    setKeyboardSwipe({ cardId: card.id, direction })
-    // After animation, record + remove the card (same logic as onSwipe)
+    requestAnimationFrame(() => {
+      ref.swipe(direction)  // react-tinder-card drives the fly-off on its own wrapper div
+    })
+
+    // Clear the in-flight lock after the animation + deferred unmount window
     setTimeout(() => {
-      setKeyboardSwipe(null)
-      onSwipe(direction, card)
-    }, KEYBOARD_SWIPE_MS)
-  }, [cards, currentIndex, onSwipe])
+      swipingRef.current = false
+      kbSwipingCardId.current = null
+    }, 700)
+  }, [cards, currentIndex])
 
   const handleUndo = useCallback(() => {
     if (swipeHistory.length === 0) return
@@ -238,9 +252,12 @@ export default function Feed({ user, company }) {
     if (view !== 'feed') return
     const handler = (e) => {
       if (expandedCard) return
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
-      if (e.key === 'ArrowLeft'  || e.key === 'j') swipe('left')
-      if (e.key === 'ArrowRight' || e.key === 'l') swipe('right')
+      // Use activeElement instead of e.target — more reliable across browsers
+      const tag = document.activeElement?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+
+      if (e.key === 'ArrowLeft'  || e.key === 'j') { e.preventDefault(); swipe('left') }
+      if (e.key === 'ArrowRight' || e.key === 'l') { e.preventDefault(); swipe('right') }
       if (e.key === 'z') handleUndo()
     }
     window.addEventListener('keydown', handler)
@@ -322,18 +339,7 @@ export default function Feed({ user, company }) {
             {/* Card stack */}
             <div style={styles.deck}>
               {cards.map((card, index) => {
-                const isSaving   = card.id === savingCardId
-                const isKbSwipe  = keyboardSwipe?.cardId === card.id
-                const kbDir      = keyboardSwipe?.direction
-
-                // Keyboard swipe: slide the card off screen with a visible arc.
-                // We own this animation entirely — no react-tinder-card involvement.
-                const kbTransform = isKbSwipe
-                  ? kbDir === 'right'
-                    ? 'translateX(160%) rotate(20deg)'
-                    : 'translateX(-160%) rotate(-20deg)'
-                  : null
-
+                const isSaving = card.id === savingCardId
                 return (
                   <TinderCard
                     key={card.id}
@@ -359,19 +365,16 @@ export default function Feed({ user, company }) {
                       style={{
                         transform: isSaving
                           ? 'scale(0.78) translateY(72px)'
-                          : kbTransform
-                          ?? (index === currentIndex
-                            ? 'scale(1)'
-                            : index === currentIndex - 1
-                            ? 'scale(0.96) translateY(12px)'
-                            : 'scale(0.92) translateY(24px)'),
+                          : index === currentIndex
+                          ? 'scale(1)'
+                          : index === currentIndex - 1
+                          ? 'scale(0.96) translateY(12px)'
+                          : 'scale(0.92) translateY(24px)',
                         opacity: isSaving ? 0
                           : index < currentIndex - 2 ? 0 : 1,
-                        zIndex: isKbSwipe ? 50 : isSaving ? 50 : index,
+                        zIndex: isSaving ? 50 : index,
                         transition: isSaving
                           ? `transform ${SAVE_ANIM_MS}ms cubic-bezier(0.4, 0, 1, 1), opacity ${SAVE_ANIM_MS * 0.8}ms ease`
-                          : isKbSwipe
-                          ? `transform ${KEYBOARD_SWIPE_MS}ms cubic-bezier(0.4, 0, 0.2, 1)`
                           : 'transform 0.2s ease, opacity 0.2s ease',
                       }}
                     />
