@@ -263,8 +263,27 @@ def fetch_page(api_key: str, params: dict, attempt: int = 1) -> dict | None:
         resp = requests.get(SAM_API_BASE, params=params, timeout=30)
 
         if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", 60))
-            logger.warning(f"Rate limited. Waiting {wait}s...")
+            # Retry-After can be an integer (seconds) or an HTTP date string.
+            # e.g. "60" vs "Fri, 01 May 2026 00:00:00 GMT"
+            retry_after = resp.headers.get("Retry-After", "60")
+            try:
+                wait = int(retry_after)
+            except ValueError:
+                # HTTP date format — compute seconds until that time
+                from email.utils import parsedate_to_datetime
+                try:
+                    until = parsedate_to_datetime(retry_after)
+                    wait = max(60, int((until - datetime.now(timezone.utc)).total_seconds()))
+                except Exception:
+                    wait = 60
+            logger.warning(f"Rate limited. Retry-After: {retry_after!r} — waiting {wait}s...")
+            if wait > 300:
+                # Quota exhausted for the day — don't sleep for hours, just abort
+                logger.error(
+                    f"SAM.gov quota exhausted until {retry_after}. "
+                    "Re-run after midnight UTC. Aborting."
+                )
+                return None
             time.sleep(wait)
             return fetch_page(api_key, params, attempt)
 
