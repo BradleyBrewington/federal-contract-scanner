@@ -625,6 +625,7 @@ def run_backfill_descriptions():
         except Exception:
             pass
     quota_available = DESC_DAILY_CAP - quota_used_today
+    quota_counter   = [quota_used_today]   # mutable so workers + sanity check can increment without nonlocal
     logger.info(f"Quota used today so far: {quota_used_today:,} / 10,000. Available for this run: {quota_available:,}")
     if quota_available <= 0:
         logger.error("Daily quota already consumed. Re-run after midnight UTC.")
@@ -721,8 +722,6 @@ def run_backfill_descriptions():
 
     counters = {"fetched": 0, "failed": 0, "no_description": 0,
                 "see_attachment": 0, "cancelled": 0, "rate_limited": 0, "aborted": 0}
-    # Mutable container so workers can increment without nonlocal
-    quota_counter = [quota_used_today]
 
     # Per-failure log: notice_id + HTTP status for pattern analysis
     failure_log_path = log_dir / f"backfill_failures_{run_date}.tsv"
