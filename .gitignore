@@ -14,3 +14,11 @@ logs/
 .~lock.*
 node_modules/
 .DS_Store
+
+# Bulk research inputs and generated scratch data sync separately
+/resource_test.pdf
+/data/tmp/
+.env.*
+!.env.example
+.claude/settings.local.json
+

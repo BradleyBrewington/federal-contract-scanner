@@ -1,6 +1,52 @@
 import { useState, useEffect } from 'react'
 import { db } from '../lib/api'
 
+function csvCell(val) {
+  if (val === null || val === undefined) return ''
+  const str = String(val)
+  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+    return '"' + str.replace(/"/g, '""') + '"'
+  }
+  return str
+}
+
+function exportCsv(items) {
+  const headers = [
+    'Title', 'Agency', 'Sub-Agency', 'Notice ID', 'Notice Type',
+    'NAICS Code', 'Set-Aside', 'Est. Value', 'Deadline', 'Posted Date',
+    'Place of Performance', 'Pipeline Stage', 'SAM.gov URL',
+  ]
+  const rows = items.map(item => {
+    const opp = item.opportunities || {}
+    const samUrl = opp.notice_id ? `https://sam.gov/opp/${opp.notice_id}/view` : ''
+    const deadline = opp.response_deadline
+      ? new Date(opp.response_deadline).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+      : ''
+    const posted = opp.posted_date
+      ? new Date(opp.posted_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+      : ''
+    const pop = [opp.pop_city, opp.pop_state].filter(Boolean).join(', ')
+    const val = opp.value_max ? valueDisplay(opp.value_max) : ''
+    const setAside = opp.set_aside_type && opp.set_aside_type !== 'NONE'
+      ? (SET_ASIDE_LABELS[opp.set_aside_type] || opp.set_aside_type)
+      : ''
+    return [
+      opp.title || '', opp.agency || '', opp.sub_agency || '',
+      opp.notice_id || '', opp.notice_type || '', opp.naics_code || '',
+      setAside, val, deadline, posted, pop,
+      item.stage || 'watching', samUrl,
+    ].map(csvCell).join(',')
+  })
+  const csv = [headers.map(csvCell).join(','), ...rows].join('\r\n')
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `govscroll-liked-${new Date().toISOString().slice(0, 10)}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 const SET_ASIDE_LABELS = {
   SBA: 'Small Business', '8AN': '8(a)', '8A': '8(a)',
   SDVOSBC: 'SDVOSB', SDVOSBR: 'SDVOSB',
@@ -25,6 +71,24 @@ function valueDisplay(max) {
 export default function SavedList({ company, onRemove }) {
   const [items, setItems] = useState([])
   const [loading, setLoading] = useState(true)
+  const [copiedId, setCopiedId] = useState(null)
+
+  function handleShare(opp, itemId) {
+    const url = opp.notice_id ? `https://sam.gov/opp/${opp.notice_id}/view` : 'https://sam.gov'
+    if (navigator.share) {
+      const agency = opp.sub_agency || opp.agency || ''
+      navigator.share({
+        title: opp.title || 'Government Contract Opportunity',
+        text: agency ? `${agency} — ${opp.title}` : opp.title,
+        url,
+      }).catch(() => {})
+    } else {
+      navigator.clipboard.writeText(url).then(() => {
+        setCopiedId(itemId)
+        setTimeout(() => setCopiedId(null), 2000)
+      }).catch(() => {})
+    }
+  }
 
   useEffect(() => {
     if (!company?.id) return
@@ -61,7 +125,12 @@ export default function SavedList({ company, onRemove }) {
 
   return (
     <div style={styles.list}>
-      <p style={styles.countLabel}>{items.length} saved</p>
+      <div style={styles.listHeader}>
+        <p style={styles.countLabel}>{items.length} saved</p>
+        <button onClick={() => exportCsv(items)} style={styles.exportBtn}>
+          Export CSV
+        </button>
+      </div>
       {items.map(item => {
         const opp = item.opportunities
         if (!opp) return null
@@ -117,6 +186,9 @@ export default function SavedList({ company, onRemove }) {
                     SAM.gov ↗
                   </a>
                 )}
+                <button onClick={() => handleShare(opp, item.id)} style={styles.actionBtn}>
+                  {copiedId === item.id ? 'Copied!' : 'Share'}
+                </button>
                 <button onClick={() => handleRemove(item)} style={styles.removeBtn}>
                   Remove
                 </button>
@@ -160,10 +232,18 @@ const styles = {
     gap: '10px',
     alignSelf: 'center',
   },
+  listHeader: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    marginBottom: '2px',
+  },
   countLabel: {
     fontSize: '11px', fontWeight: '600', color: 'var(--muted)',
     textTransform: 'uppercase', letterSpacing: '0.06em',
-    marginBottom: '2px',
+  },
+  exportBtn: {
+    fontSize: '11px', fontWeight: '600', color: 'var(--primary)',
+    background: 'none', border: '1px solid var(--primary)',
+    borderRadius: '8px', padding: '4px 10px', cursor: 'pointer',
   },
 
   item: {
@@ -204,6 +284,10 @@ const styles = {
   },
   deadline: { fontSize: '12px', fontWeight: '600' },
   samLink: { fontSize: '11px', color: 'var(--primary)', textDecoration: 'none', fontWeight: '500' },
+  actionBtn: {
+    fontSize: '11px', color: 'var(--primary)', background: 'none',
+    border: 'none', cursor: 'pointer', padding: 0, fontWeight: '500',
+  },
   removeBtn: {
     fontSize: '11px', color: 'var(--muted)', background: 'none',
     border: 'none', cursor: 'pointer', padding: 0, fontWeight: '500',
