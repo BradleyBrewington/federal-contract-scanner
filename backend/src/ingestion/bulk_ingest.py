@@ -54,11 +54,7 @@ UPSERT_BATCH      = 250       # rows per Supabase upsert call
 DESC_WORKERS      = 2         # parallel description fetches — bump to 4 if no 429s observed
 DESC_WORKER_SLEEP = 0.5       # seconds to sleep after each fetch per worker (~1 req/s total)
 DESC_MAX_CHARS    = 50_000    # store up to 50k chars of description text
-DESC_DAILY_CAP    = 9_000     # stop backfill at this many fetches/day; leaves headroom for delta + search
-SANITY_CHECK_N         = 20   # records to probe before starting main run (issue #1)
-SANITY_FAIL_THRESHOLD  = 0.20 # abort sanity if >20% return None (issue #1)
-ABORT_FAIL_THRESHOLD   = 0.05 # abort mid-run if rolling failure rate exceeds 5% (issue #8)
-RATE_LIMIT_ABORT_COUNT = 5    # shut down if this many 429s accumulate across all workers (issue #2)
+DESC_DAILY_CAP    = 800       # conservative cap for noticedesc endpoint (~1,000 actual daily limit)
 DATA_DIR      = Path(__file__).resolve().parents[3] / "data"
 LAST_RUN_FILE = DATA_DIR / "last_ingest.txt"
 
@@ -167,17 +163,10 @@ def fetch_description(notice_id: str, api_key: str) -> tuple[str | None, int | N
     try:
         resp = _do_request()
 
-        # 429 — rate limited: sleep 30s and retry once
+        # 429 — daily quota exhausted; do not retry (30s sleep doesn't help)
         if resp.status_code == 429:
-            logger.warning(f"429 on {notice_id} — sleeping 30s then retrying")
-            time.sleep(30)
-            try:
-                resp = _do_request()
-            except Exception:
-                return None, 429
-            if resp.status_code == 429:
-                logger.warning(f"429 again on {notice_id} after retry — aborting this record")
-                return None, 429
+            logger.warning(f"429 on {notice_id} — quota exhausted, aborting record")
+            return None, 429
 
         # 5xx — transient server error: sleep 10s and retry once
         if resp.status_code >= 500:
@@ -317,7 +306,7 @@ def fetch_all_opportunities(api_key: str, posted_from: str, posted_to: str, modi
     if modified_from:
         params["modifiedFrom"] = modified_from
 
-    logger.info(f"Fetching SAM.gov opportunities: {posted_from} → {posted_to}" +
+    logger.info(f"Fetching SAM.gov opportunities: {posted_from} -> {posted_to}" +
                 (f" (modified since {modified_from})" if modified_from else ""))
 
     first_page = fetch_page(api_key, params)
@@ -584,9 +573,9 @@ def run_delta_load():
 
     parsed = [parse_opportunity(r) for r in raw_records if r.get("noticeId")]
 
-    # Fetch real description text for any records that only have a SAM.gov URL.
-    # Delta batches are typically small (50–500 records) so this adds <1 minute.
-    parsed = enrich_descriptions(parsed, api_key)
+    # Descriptions are now handled by daily CSV ingest — see csv_ingest.py.
+    # enrich_descriptions() is retained for attachment downloads and see-attached
+    # records only; it is not called here on the normal delta path.
 
     written = upsert_all(supabase, parsed)
 
@@ -594,311 +583,29 @@ def run_delta_load():
     logger.info(f"=== DELTA LOAD complete: {written:,} records written ===")
 
 
-def run_backfill_descriptions():
-    """
-    Resumable backfill: fetch real description text for active DB records whose
-    description field is still a SAM.gov API URL.
-
-    Fixes applied:
-      #1  Sanity check: 20 records, abort if >20% return None
-      #2  Exponential backoff on 429/5xx in fetch_description; abort if 5 total 429s
-      #3  Ordering: posted_date DESC (best available without impression tracking)
-      #5  see_attachment: notice_ids logged to data/see_attachment_YYYY-MM-DD.txt
-      #6  Withdrawn/cancelled detection: updates status column, skips description write
-      #7  Persistent log file at data/logs/backfill_YYYY-MM-DD.log
-      #8  Mid-run abort if rolling failure rate exceeds 5% after 100 records
-      #9  Saves original URL to description_url before overwriting; falls back if column missing
-      #10 _strip_html uses BeautifulSoup when available + html.unescape
-
-    Prerequisite schema change (run once in Supabase SQL Editor):
-      ALTER TABLE opportunities
-        ADD COLUMN IF NOT EXISTS description_url TEXT,
-        ADD COLUMN IF NOT EXISTS description_fetched_at TIMESTAMPTZ;
-
-    Run daily until complete:
-      py -3 backend/src/ingestion/bulk_ingest.py --backfill-descriptions
-
-    Safe to interrupt and re-run — enriched records no longer match the URL filter.
-    """
-    run_start = datetime.now(timezone.utc)
-    run_date  = run_start.strftime("%Y-%m-%d")
-
-    # ── Persistent log file ─────────────────────────────────────────────────
-    log_dir = DATA_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(log_dir / f"backfill_{run_date}.log")
-    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logger.addHandler(file_handler)
-
-    logger.info("=== DESCRIPTION BACKFILL starting ===")
-    supabase = get_supabase()
-    api_key  = get_sam_api_key()
-
-    # ── Quota tracking ──────────────────────────────────────────────────────
-    # SAM.gov doesn't expose remaining quota via headers — track client-side.
-    quota_file = DATA_DIR / f"quota_{run_date}.json"
-    quota_used_today = 0
-    if quota_file.exists():
-        try:
-            quota_used_today = json.loads(quota_file.read_text()).get("used", 0)
-        except Exception:
-            pass
-    quota_available = DESC_DAILY_CAP - quota_used_today
-    quota_counter   = [quota_used_today]   # mutable so workers + sanity check can increment without nonlocal
-    logger.info(f"Quota used today so far: {quota_used_today:,} / 10,000. Available for this run: {quota_available:,}")
-    if quota_available <= 0:
-        logger.error("Daily quota already consumed. Re-run after midnight UTC.")
-        logger.removeHandler(file_handler)
-        return
-
-    # ── Collect work set ────────────────────────────────────────────────────
-    # Fetch description field too so we can save it to description_url before overwriting.
-    # Active-only: expired records never surface in the feed.
-    # posted_date DESC: most recently posted = most likely to appear in feed.
-    all_stubs = []
-    offset    = 0
-    page_size = 1000
-    while True:
-        batch = (
-            supabase.table("opportunities")
-            .select("id, notice_id, description")
-            .eq("status", "active")
-            .ilike("description", "http%")
-            .order("posted_date", desc=True)
-            .range(offset, offset + page_size - 1)
-            .execute()
-        )
-        rows = batch.data or []
-        if not rows:
-            break
-        all_stubs.extend(rows)
-        logger.info(f"Found {len(all_stubs):,} active URL-description records so far...")
-        if len(rows) < page_size:
-            break
-        offset += page_size
-
-    if not all_stubs:
-        logger.info("No active URL-description records found — backfill complete.")
-        logger.removeHandler(file_handler)
-        return
-
-    capped   = len(all_stubs) > quota_available
-    work_set = all_stubs[:quota_available]
-    logger.info(
-        f"{'Capping at quota' if capped else 'Processing'} {len(work_set):,} of "
-        f"{len(all_stubs):,} records (workers: {DESC_WORKERS})"
-    )
-    if capped:
-        logger.info(f"Re-run tomorrow for the remaining {len(all_stubs) - quota_available:,} records.")
-
-    # ── Sanity check — 20 records, abort if >20% fail ───────────────────────
-    logger.info(f"Sanity-checking noticedesc API ({SANITY_CHECK_N} records)...")
-    sanity_none = 0
-    sanity_done = 0
-    for stub in work_set[:SANITY_CHECK_N]:
-        text, status = fetch_description(stub["notice_id"], api_key)
-        sanity_done += 1
-        quota_counter[0] += 1
-        if text is None:
-            sanity_none += 1
-            logger.debug(f"  Sanity FAIL: {stub['notice_id']} → HTTP {status}")
-            # 429 that survived a 30s retry means the daily quota is exhausted.
-            # Every subsequent check will also 429 — fast-fail immediately rather
-            # than spending 20 × 60s probing a wall.
-            if status == 429:
-                logger.error(
-                    "429 confirmed after retry — daily API quota is exhausted. "
-                    "Re-run after midnight Eastern Time. Aborting."
-                )
-                quota_file.write_text(json.dumps({"used": quota_counter[0], "date": run_date}))
-                logger.removeHandler(file_handler)
-                return
-        else:
-            label = "no desc" if text == "" else f"{len(text):,} chars"
-            logger.info(f"  Sanity OK:   {stub['notice_id']} → HTTP {status} ({label})")
-
-    fail_rate = sanity_none / sanity_done if sanity_done else 1.0
-    if fail_rate > SANITY_FAIL_THRESHOLD:
-        logger.error(
-            f"Sanity check FAILED: {sanity_none}/{sanity_done} ({fail_rate:.0%}) returned errors. "
-            f"Likely causes: daily quota active (try after midnight UTC), API key invalid, "
-            f"or endpoint URL changed. Aborting."
-        )
-        quota_file.write_text(json.dumps({"used": quota_counter[0], "date": run_date}))
-        logger.removeHandler(file_handler)
-        return
-    logger.info(f"Sanity check passed ({fail_rate:.0%} failure rate). Starting main run...")
-
-    # Skip sanity records from main work set to avoid double-fetching
-    work_set = work_set[SANITY_CHECK_N:]
-
-    # ── Shared state for workers ────────────────────────────────────────────
-    sb_url         = os.getenv("SUPABASE_URL")
-    sb_key         = os.getenv("SUPABASE_SERVICE_KEY")
-    shutdown_event = threading.Event()
-    results_lock   = threading.Lock()
-    quota_lock     = threading.Lock()
-
-    counters = {"fetched": 0, "failed": 0, "no_description": 0,
-                "see_attachment": 0, "cancelled": 0, "rate_limited": 0, "aborted": 0}
-
-    # Per-failure log: notice_id + HTTP status for pattern analysis
-    failure_log_path = log_dir / f"backfill_failures_{run_date}.tsv"
-    failure_log = open(failure_log_path, "a", encoding="utf-8")
-    failure_log.write("notice_id\thttp_status\ttimestamp\n")
-
-    # see_attachment log: notice_ids for spot-checking threshold accuracy
-    attachment_log_path = DATA_DIR / f"see_attachment_{run_date}.txt"
-    attachment_log = open(attachment_log_path, "a", encoding="utf-8")
-
-    def _fetch_and_update(stub):
-        if shutdown_event.is_set():
-            return "aborted"
-
-        sb           = create_client(sb_url, sb_key)
-        notice_id    = stub["notice_id"]
-        original_url = stub.get("description", "")
-
-        text, status = fetch_description(notice_id, api_key)
-        time.sleep(DESC_WORKER_SLEEP)
-
-        with quota_lock:
-            quota_counter[0] += 1
-
-        # 429 — rate limited even after the built-in retry in fetch_description
-        if status == 429:
-            with results_lock:
-                counters["rate_limited"] += 1
-                if counters["rate_limited"] >= RATE_LIMIT_ABORT_COUNT:
-                    logger.error(f"{RATE_LIMIT_ABORT_COUNT} rate-limit hits — triggering shutdown to preserve quota")
-                    shutdown_event.set()
-            failure_log.write(f"{notice_id}\t{status}\t{datetime.now(timezone.utc).isoformat()}\n")
-            return "rate_limited"
-
-        # Real error (connection, 5xx that didn't resolve after retry)
-        if text is None:
-            failure_log.write(f"{notice_id}\t{status}\t{datetime.now(timezone.utc).isoformat()}\n")
-            return "failed"
-
-        # 404 — no description registered for this notice
-        if text == "":
-            return "no_description"
-
-        lower = text.lower()
-
-        # Withdrawn/cancelled notice — update status, don't write as description
-        if any(phrase in lower for phrase in _WITHDRAWN_PHRASES):
-            try:
-                sb.table("opportunities").update({"status": "cancelled"}).eq("id", stub["id"]).execute()
-            except Exception as e:
-                logger.debug(f"Status update failed for {notice_id}: {e}")
-            return "cancelled"
-
-        # "See attachment" — substantive content is in a file, not this text
-        if _is_see_attachment(text):
-            attachment_log.write(f"{notice_id}\n")
-            return "see_attachment"
-
-        # Write description. Attempt to preserve original URL in description_url.
-        update_data = {
-            "description": text,
-            "description_fetched_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if original_url.startswith("http"):
-            update_data["description_url"] = original_url
-
-        try:
-            sb.table("opportunities").update(update_data).eq("id", stub["id"]).execute()
-            return "fetched"
-        except Exception as e:
-            # If description_url or description_fetched_at column doesn't exist yet,
-            # retry with just the description field so the run doesn't fail.
-            if "description_url" in str(e) or "description_fetched_at" in str(e):
-                logger.warning("description_url/fetched_at column missing — run the ALTER TABLE DDL in Supabase")
-                try:
-                    sb.table("opportunities").update({"description": text}).eq("id", stub["id"]).execute()
-                    return "fetched"
-                except Exception as e2:
-                    logger.warning(f"Fallback update failed for {notice_id}: {e2}")
-                    failure_log.write(f"{notice_id}\tDB_ERROR\t{datetime.now(timezone.utc).isoformat()}\n")
-                    return "failed"
-            logger.warning(f"Update failed for {notice_id}: {e}")
-            failure_log.write(f"{notice_id}\tDB_ERROR\t{datetime.now(timezone.utc).isoformat()}\n")
-            return "failed"
-
-    # ── Main run ────────────────────────────────────────────────────────────
-    with ThreadPoolExecutor(max_workers=DESC_WORKERS) as pool:
-        futures = [pool.submit(_fetch_and_update, stub) for stub in work_set]
-        for i, future in enumerate(as_completed(futures), 1):
-            result = future.result()
-            with results_lock:
-                counters[result] = counters.get(result, 0) + 1
-
-            # Rolling failure-rate check — abort if >5% after first 100 completions
-            if i >= 100 and i % 100 == 0:
-                total_attempted = counters["fetched"] + counters["failed"] + counters["rate_limited"]
-                hard_failures   = counters["failed"] + counters["rate_limited"]
-                roll_rate       = hard_failures / total_attempted if total_attempted else 0
-                if roll_rate > ABORT_FAIL_THRESHOLD:
-                    logger.error(
-                        f"Failure rate {roll_rate:.1%} exceeds {ABORT_FAIL_THRESHOLD:.0%} threshold "
-                        f"after {i:,} records — aborting to preserve quota"
-                    )
-                    shutdown_event.set()
-
-            if shutdown_event.is_set():
-                logger.warning("Shutdown signal received — cancelling remaining futures")
-                for f in futures:
-                    f.cancel()
-                break
-
-            if i % 500 == 0 or i == len(work_set):
-                total    = sum(counters.values())
-                failures = counters["failed"] + counters["rate_limited"]
-                logger.info(
-                    f"Progress {i:,}/{len(work_set):,} | "
-                    f"fetched={counters['fetched']:,} no_desc={counters['no_description']:,} "
-                    f"see_attach={counters['see_attachment']:,} cancelled={counters['cancelled']:,} "
-                    f"failed={failures:,} | "
-                    f"fail_rate={failures/max(total,1):.1%} quota_used≈{quota_counter[0]:,}"
-                )
-
-    failure_log.close()
-    attachment_log.close()
-
-    # Persist quota count
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    quota_file.write_text(json.dumps({"used": quota_counter[0], "date": run_date}))
-
-    elapsed = (datetime.now(timezone.utc) - run_start).total_seconds()
-    logger.info(
-        f"=== DESCRIPTION BACKFILL complete in {elapsed/60:.1f}min | "
-        f"fetched={counters['fetched']:,} no_desc={counters['no_description']:,} "
-        f"see_attach={counters['see_attachment']:,} cancelled={counters['cancelled']:,} "
-        f"failed={counters['failed']:,} rate_limited={counters['rate_limited']:,} "
-        f"aborted={counters['aborted']:,} quota_used≈{quota_counter[0]:,} ==="
-    )
-    logger.info(f"Failure log: {failure_log_path}")
-    logger.info(f"See-attachment log: {attachment_log_path}")
-    if capped or shutdown_event.is_set():
-        remaining = len(all_stubs) - quota_available
-        logger.info(f"Re-run tomorrow for remaining ~{max(remaining,0):,} records.")
-
-    logger.removeHandler(file_handler)
-
-
 if __name__ == "__main__":
+    from csv_ingest import run_csv_ingest, validate_csv_descriptions, load_csv_duckdb, CSV_URL
+
     parser = argparse.ArgumentParser(description="SAM.gov bulk ingestion pipeline")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--full",  action="store_true", help="Full load: all opportunities from past 365 days")
     group.add_argument("--delta", action="store_true", help="Delta load: only records modified since last run")
-    group.add_argument("--backfill-descriptions", action="store_true",
-                       help="One-time: fetch real description text for all DB records that still have a SAM.gov URL")
+    group.add_argument("--csv-ingest", action="store_true",
+                       help="Daily CSV ingest: load descriptions from GSA public extract (s3.amazonaws.com/falextracts/...)")
+    group.add_argument("--validate-csv", action="store_true",
+                       help="Validate CSV descriptions against existing API-sourced DB records before cutover")
     args = parser.parse_args()
 
     if args.full:
         run_full_load()
     elif args.delta:
         run_delta_load()
-    elif args.backfill_descriptions:
-        run_backfill_descriptions()
+    elif args.csv_ingest:
+        stats = run_csv_ingest()
+        logger.info(f"CSV ingest stats: {stats}")
+    elif args.validate_csv:
+        logger.info("Loading CSV for validation...")
+        raw_rows = load_csv_duckdb(CSV_URL)
+        logger.info(f"Loaded {len(raw_rows):,} rows from CSV")
+        passed = validate_csv_descriptions(raw_rows)
+        sys.exit(0 if passed else 1)
