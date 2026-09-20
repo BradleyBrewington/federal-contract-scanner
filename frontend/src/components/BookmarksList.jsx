@@ -25,6 +25,24 @@ function valueDisplay(max) {
 export default function BookmarksList({ company, onRemove }) {
   const [items, setItems] = useState([])
   const [loading, setLoading] = useState(true)
+  const [copiedId, setCopiedId] = useState(null)
+
+  function handleShare(opp, itemId) {
+    const url = opp.notice_id ? `https://sam.gov/opp/${opp.notice_id}/view` : 'https://sam.gov'
+    if (navigator.share) {
+      const agency = opp.sub_agency || opp.agency || ''
+      navigator.share({
+        title: opp.title || 'Government Contract Opportunity',
+        text: agency ? `${agency} — ${opp.title}` : opp.title,
+        url,
+      }).catch(() => {})
+    } else {
+      navigator.clipboard.writeText(url).then(() => {
+        setCopiedId(itemId)
+        setTimeout(() => setCopiedId(null), 2000)
+      }).catch(() => {})
+    }
+  }
 
   useEffect(() => {
     if (!company?.id) return
@@ -117,6 +135,9 @@ export default function BookmarksList({ company, onRemove }) {
                     SAM.gov ↗
                   </a>
                 )}
+                <button onClick={() => handleShare(opp, item.id)} style={styles.actionBtn}>
+                  {copiedId === item.id ? 'Copied!' : 'Share'}
+                </button>
                 <button onClick={() => handleRemove(item)} style={styles.removeBtn}>
                   Remove
                 </button>
@@ -204,6 +225,10 @@ const styles = {
   },
   deadline: { fontSize: '12px', fontWeight: '600' },
   samLink: { fontSize: '11px', color: 'var(--primary)', textDecoration: 'none', fontWeight: '500' },
+  actionBtn: {
+    fontSize: '11px', color: 'var(--primary)', background: 'none',
+    border: 'none', cursor: 'pointer', padding: 0, fontWeight: '500',
+  },
   removeBtn: {
     fontSize: '11px', color: 'var(--muted)', background: 'none',
     border: 'none', cursor: 'pointer', padding: 0, fontWeight: '500',

@@ -1,4 +1,4 @@
-import { } from 'react'
+import { useState } from 'react'
 
 const NOTICE_LABELS = {
   solicitation: 'Solicitation',
@@ -27,6 +27,25 @@ function unwrapDescription(text) {
 }
 
 export default function DetailModal({ card, onClose, onPass, onSave }) {
+  const [copied, setCopied] = useState(false)
+
+  function handleShare() {
+    const url = card.sam_url || `https://sam.gov/opp/${card.notice_id}/view`
+    if (navigator.share) {
+      const agency = card.sub_agency || card.agency || ''
+      navigator.share({
+        title: card.title || 'Government Contract Opportunity',
+        text: agency ? `${agency} — ${card.title}` : card.title,
+        url,
+      }).catch(() => {})
+    } else {
+      navigator.clipboard.writeText(url).then(() => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 2000)
+      }).catch(() => {})
+    }
+  }
+
   const scope = card.parsed_scope || {}
   const hasScope = scope.qty_display || scope.delivery_display || scope.nsn || scope.approved_source
   const descriptionText = unwrapDescription(card.description_text)
@@ -60,6 +79,9 @@ export default function DetailModal({ card, onClose, onPass, onSave }) {
               <p style={styles.agencyName}>{card.sub_agency || card.agency || 'Unknown Agency'}</p>
               {card.sub_agency && <p style={styles.subAgency}>{card.agency}</p>}
             </div>
+            <button onClick={handleShare} style={styles.shareBtn} title="Share">
+              {copied ? '✓' : '↑'}
+            </button>
             <button onClick={onClose} style={styles.closeBtn}>✕</button>
           </div>
           <h2 style={styles.title}>{card.title}</h2>
@@ -244,6 +266,12 @@ const styles = {
   },
   agencyName: { fontSize: '13px', fontWeight: '600', color: 'var(--text)' },
   subAgency: { fontSize: '11px', color: 'var(--muted)', marginTop: '1px' },
+  shareBtn: {
+    background: 'none', border: '1px solid var(--border)',
+    borderRadius: '50%', width: '44px', height: '44px',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    fontSize: '16px', color: 'var(--primary)', cursor: 'pointer', flexShrink: 0,
+  },
   closeBtn: {
     background: 'var(--surface2)', border: '1px solid var(--border)',
     borderRadius: '50%', width: '44px', height: '44px',
